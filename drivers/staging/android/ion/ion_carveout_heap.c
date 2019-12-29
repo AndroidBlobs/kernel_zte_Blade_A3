@@ -24,6 +24,9 @@
 #include <linux/vmalloc.h>
 #include "ion.h"
 #include "ion_priv.h"
+#ifdef CONFIG_ION_POOL_CACHE_POLICY
+#include <asm/cacheflush.h>
+#endif
 
 struct ion_carveout_heap {
 	struct ion_heap heap;
@@ -93,7 +96,18 @@ static int ion_carveout_heap_allocate(struct ion_heap *heap,
 		ret = -ENOMEM;
 		goto err_free_table;
 	}
+#ifdef CONFIG_ION_POOL_CACHE_POLICY
+	if (!ion_buffer_cached(buffer)) {
+		void *va;
 
+		va = page_address(pfn_to_page(PFN_DOWN(paddr)));
+		if (va) {
+			pr_debug("set_memory_wc, paddr: 0x%lx, size: 0x%zx\n",
+				 paddr, size);
+			set_memory_wc((unsigned long)va, size / PAGE_SIZE);
+		}
+	}
+#endif
 	sg_set_page(table->sgl, pfn_to_page(PFN_DOWN(paddr)), size, 0);
 	buffer->priv_virt = table;
 
@@ -112,13 +126,26 @@ static void ion_carveout_heap_free(struct ion_buffer *buffer)
 	struct sg_table *table = buffer->priv_virt;
 	struct page *page = sg_page(table->sgl);
 	ion_phys_addr_t paddr = PFN_PHYS(page_to_pfn(page));
+	struct device *dev = heap->device;
 
 	ion_heap_buffer_zero(buffer);
 
 	if (ion_buffer_cached(buffer))
-		dma_sync_sg_for_device(NULL, table->sgl, table->nents,
-							DMA_BIDIRECTIONAL);
+		dma_sync_sg_for_device(dev, table->sgl, table->nents,
+				       DMA_BIDIRECTIONAL);
+#ifdef CONFIG_ION_POOL_CACHE_POLICY
+	if (!ion_buffer_cached(buffer)) {
+		void *va;
 
+		va = page_address(page);
+		if (va) {
+			pr_debug("set_memory_wb, paddr: 0x%lx, size: 0x%zx\n",
+				 paddr, buffer->size);
+			set_memory_wb((unsigned long)va,
+				      buffer->size / PAGE_SIZE);
+		}
+	}
+#endif
 	ion_carveout_free(heap, paddr, buffer->size);
 	sg_free_table(table);
 	kfree(table);
@@ -150,6 +177,7 @@ struct ion_heap *ion_carveout_heap_create(struct ion_platform_heap *heap_data)
 {
 	struct ion_carveout_heap *carveout_heap;
 	int ret;
+	struct device *dev = heap_data->priv;
 
 	struct page *page;
 	size_t size;
@@ -157,17 +185,19 @@ struct ion_heap *ion_carveout_heap_create(struct ion_platform_heap *heap_data)
 	page = pfn_to_page(PFN_DOWN(heap_data->base));
 	size = heap_data->size;
 
-	ion_pages_sync_for_device(NULL, page, size, DMA_BIDIRECTIONAL);
+	ion_pages_sync_for_device(dev, page, size, DMA_BIDIRECTIONAL);
 
-	ret = ion_heap_pages_zero(page, size, pgprot_writecombine(PAGE_KERNEL));
-	if (ret)
-		return ERR_PTR(ret);
-
+	if (heap_data->init_clean) {
+		ret = ion_heap_pages_zero(page, size,
+					  pgprot_writecombine(PAGE_KERNEL));
+		if (ret)
+			return ERR_PTR(ret);
+	}
 	carveout_heap = kzalloc(sizeof(struct ion_carveout_heap), GFP_KERNEL);
 	if (!carveout_heap)
 		return ERR_PTR(-ENOMEM);
 
-	carveout_heap->pool = gen_pool_create(12, -1);
+	carveout_heap->pool = gen_pool_create(PAGE_SHIFT, -1);
 	if (!carveout_heap->pool) {
 		kfree(carveout_heap);
 		return ERR_PTR(-ENOMEM);

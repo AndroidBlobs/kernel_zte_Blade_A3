@@ -26,10 +26,21 @@
 #include <linux/sched.h>
 #include <linux/shrinker.h>
 #include <linux/types.h>
+#ifdef CONFIG_ION_POOL_CACHE_POLICY
+#include <asm/cacheflush.h>
+#endif
 
 #include "ion.h"
 
 struct ion_buffer *ion_handle_buffer(struct ion_handle *handle);
+
+/**
+ * allocation flags - the ion buffer needn't to clear zero.
+ */
+#define ION_NOCLEAR_BIT		16
+#define ION_FLAG_NOCLEAR	BIT(ION_NOCLEAR_BIT)
+
+#define IOMAP_MAX    16
 
 /**
  * struct ion_buffer - metadata for a particular buffer
@@ -84,6 +95,9 @@ struct ion_buffer {
 	int handle_count;
 	char task_comm[TASK_COMM_LEN];
 	pid_t pid;
+	pid_t pid_egl;
+	char task_egl[TASK_COMM_LEN];
+	int iomap_cnt[IOMAP_MAX];
 };
 void ion_buffer_destroy(struct ion_buffer *buffer);
 
@@ -178,7 +192,7 @@ struct ion_heap {
 	spinlock_t free_lock;
 	wait_queue_head_t waitqueue;
 	struct task_struct *task;
-
+	struct device *device;
 	int (*debug_show)(struct ion_heap *heap, struct seq_file *, void *);
 };
 
@@ -372,15 +386,51 @@ struct ion_page_pool {
 	struct list_head high_items;
 	struct list_head low_items;
 	struct mutex mutex;
+	struct device *dev;
 	gfp_t gfp_mask;
 	unsigned int order;
+	bool is_cache;
 	struct plist_node list;
 };
 
-struct ion_page_pool *ion_page_pool_create(gfp_t gfp_mask, unsigned int order);
+struct ion_page_pool *ion_page_pool_create(struct device *dev, gfp_t gfp_mask,
+					   unsigned int order);
 void ion_page_pool_destroy(struct ion_page_pool *);
-struct page *ion_page_pool_alloc(struct ion_page_pool *);
+struct page *ion_page_pool_alloc(struct ion_page_pool *,
+				 unsigned long buffer_flag,
+				 bool *from_pool);
 void ion_page_pool_free(struct ion_page_pool *, struct page *);
+void ion_page_pool_free_immediate(struct ion_page_pool *, struct page *);
+
+#ifdef CONFIG_ION_POOL_CACHE_POLICY
+static inline void ion_page_pool_alloc_set_cache_policy
+				(struct ion_page_pool *pool,
+				struct page *page){
+	void *va = page_address(page);
+
+	if (va)
+		set_memory_wc((unsigned long)va, 1 << pool->order);
+}
+
+static inline void ion_page_pool_free_set_cache_policy
+				(struct ion_page_pool *pool,
+				struct page *page){
+	void *va = page_address(page);
+
+	if (va)
+		set_memory_wb((unsigned long)va, 1 << pool->order);
+
+}
+#else
+static inline void ion_page_pool_alloc_set_cache_policy
+				(struct ion_page_pool *pool,
+				struct page *page){ }
+
+static inline void ion_page_pool_free_set_cache_policy
+				(struct ion_page_pool *pool,
+				struct page *page){ }
+#endif
+
 
 /** ion_page_pool_shrink - shrinks the size of the memory cached in the pool
  * @pool:		the pool

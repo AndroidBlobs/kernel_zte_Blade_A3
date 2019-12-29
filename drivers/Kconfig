@@ -198,4 +198,11 @@ source "drivers/hwtracing/intel_th/Kconfig"
 
 source "drivers/fpga/Kconfig"
 
+source "drivers/cpuhotplug/Kconfig"
+
+source "drivers/tee/Kconfig"
+
+source "drivers/trusty/Kconfig"
+
+source "drivers/mobilevisor/Kconfig"
 endmenu

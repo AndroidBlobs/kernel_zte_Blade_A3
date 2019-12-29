@@ -785,5 +785,44 @@ config REGULATOR_WM8994
 	  This driver provides support for the voltage regulators on the
 	  WM8994 CODEC.
 
+config REGULATOR_SC2723
+	tristate "Spreadtrum sc2723 regulator driver"
+	depends on SPI_SPRD_ADI
+	help
+          This driver provides support for the voltage regulators of the
+          SC2723 PMIC.
+
+config REGULATOR_SC2731
+	tristate "Spreadtrum sc2731 regulator driver"
+	depends on SPI_SPRD_ADI
+	help
+          This driver provides support for the voltage regulators of the
+          SC2731 PMIC.
+
+config REGULATOR_FAN53555_DCDC
+        tristate "Regulator support fan53555 dcdc"
+        depends on I2C
+        help
+          Say Y here to support fan53555 dcdc
+
+config REGULATOR_IWHALE2
+	tristate "Spreadtrum iwhale2 internal regulator driver"
+	help
+          This driver provides support for the voltage regulators of the
+          iwhale2 internal LDO.
+
+config REGULATOR_SC2721
+	tristate "Spreadtrum sc2721 regulator driver"
+	depends on SPI_SPRD_ADI
+	help
+          This driver provides support for the voltage regulators of the
+          SC2721 PMIC.
+
+config REGULATOR_SC2720
+	tristate "Spreadtrum sc2720 regulator driver"
+	depends on SPI_SPRD_ADI
+	help
+          This driver provides support for the voltage regulators of the
+          SC2720 PMIC.
 endif
 

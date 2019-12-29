@@ -36,7 +36,7 @@
 #define SPRD_FIFO_SIZE		128
 #define SPRD_DEF_RATE		26000000
 #define SPRD_BAUD_IO_LIMIT	3000000
-#define SPRD_TIMEOUT		256
+#define SPRD_TIMEOUT		256000
 
 /* the offset of serial registers and BITs for them */
 /* data registers */
@@ -63,6 +63,7 @@
 
 /* interrupt clear register */
 #define SPRD_ICLR		0x0014
+#define SPRD_ICLR_TIMEOUT	BIT(13)
 
 /* line control register */
 #define SPRD_LCR		0x0018
@@ -116,6 +117,7 @@ struct sprd_uart_port {
 	struct uart_port port;
 	struct reg_backup reg_bak;
 	char name[16];
+	struct clk  *clk;
 };
 
 static struct sprd_uart_port *sprd_port[UART_NR_MAX];
@@ -297,8 +299,10 @@ static irqreturn_t sprd_handle_irq(int irq, void *dev_id)
 		spin_unlock(&port->lock);
 		return IRQ_NONE;
 	}
-
-	serial_out(port, SPRD_ICLR, ~0);
+	if (ims & SPRD_IMSR_TIMEOUT)
+		serial_out(port, SPRD_ICLR, (u32)SPRD_ICLR_TIMEOUT);
+	else
+		serial_out(port, SPRD_ICLR, ~(u32)SPRD_ICLR_TIMEOUT);
 
 	if (ims & (SPRD_IMSR_RX_FIFO_FULL |
 		SPRD_IMSR_BREAK_DETECT | SPRD_IMSR_TIMEOUT))
@@ -378,7 +382,7 @@ static void sprd_set_termios(struct uart_port *port,
 	/* ask the core to calculate the divisor for us */
 	baud = uart_get_baud_rate(port, termios, old, 0, SPRD_BAUD_IO_LIMIT);
 
-	quot = (unsigned int)((port->uartclk + baud / 2) / baud);
+	quot = (unsigned int)(port->uartclk / baud);
 
 	/* set data length */
 	switch (termios->c_cflag & CSIZE) {
@@ -498,6 +502,22 @@ static int sprd_verify_port(struct uart_port *port,
 	return 0;
 }
 
+static void sprd_pm(struct uart_port *port, unsigned int state,
+		unsigned int oldstate)
+{
+	struct sprd_uart_port *sup
+		= container_of(port, struct sprd_uart_port, port);
+
+	switch (state) {
+	case UART_PM_STATE_ON:
+		clk_enable(sup->clk);
+		break;
+	case UART_PM_STATE_OFF:
+		clk_disable(sup->clk);
+		break;
+	}
+}
+
 static struct uart_ops serial_sprd_ops = {
 	.tx_empty = sprd_tx_empty,
 	.get_mctrl = sprd_get_mctrl,
@@ -514,6 +534,7 @@ static struct uart_ops serial_sprd_ops = {
 	.request_port = sprd_request_port,
 	.config_port = sprd_config_port,
 	.verify_port = sprd_verify_port,
+	.pm = sprd_pm,
 };
 
 #ifdef CONFIG_SERIAL_SPRD_CONSOLE
@@ -626,7 +647,9 @@ static int __init sprd_early_console_setup(
 }
 
 EARLYCON_DECLARE(sprd_serial, sprd_early_console_setup);
-OF_EARLYCON_DECLARE(sprd_serial, "sprd,sc9836-uart",
+OF_EARLYCON_DECLARE(sprd_serial_sc9836, "sprd,sc9836-uart",
+		    sprd_early_console_setup);
+OF_EARLYCON_DECLARE(sprd_serial_sc9838, "sprd,sc9838-uart",
 		    sprd_early_console_setup);
 
 #else /* !CONFIG_SERIAL_SPRD_CONSOLE */
@@ -672,6 +695,7 @@ static int sprd_remove(struct platform_device *dev)
 
 	if (sup) {
 		uart_remove_one_port(&sprd_uart_driver, &sup->port);
+		clk_unprepare(sup->clk);
 		sprd_port[sup->port.line] = NULL;
 		sprd_ports_num--;
 	}
@@ -682,11 +706,56 @@ static int sprd_remove(struct platform_device *dev)
 	return 0;
 }
 
+static int sprd_clk_init(struct uart_port *uport)
+{
+	struct clk *clk_uart, *clk_parent;
+	struct device_node *np = uport->dev->of_node;
+	struct sprd_uart_port *u = sprd_port[uport->line];
+
+	clk_uart = of_clk_get_by_name(np, "uart");
+	if (IS_ERR(clk_uart)) {
+		dev_warn(uport->dev,
+			"uart%d can't get the clock dts config: uart\n",
+			uport->line);
+		clk_uart = NULL;
+	}
+
+	clk_parent = of_clk_get_by_name(np, "source");
+	if (IS_ERR(clk_parent)) {
+		dev_warn(uport->dev,
+			"uart%d can't get the clock dts config: source\n",
+			uport->line);
+		clk_parent = NULL;
+	}
+
+	clk_set_parent(clk_uart, clk_parent);
+	uport->uartclk = clk_get_rate(clk_uart);
+
+	dev_err(uport->dev, "uart%d set source clock is %d\n",
+		uport->line, uport->uartclk);
+
+	if (!uport->uartclk) {
+		uport->uartclk = 26000000;
+		dev_warn(uport->dev, "Can't find clk-uart -- switch to FPGA mode!\n");
+	}
+
+	u->clk = of_clk_get_by_name(np, "enable");
+
+	if (IS_ERR(u->clk)) {
+		dev_warn(uport->dev,
+			"uart%d can't get the clock dts config: enable\n",
+			uport->line);
+		u->clk = NULL;
+	}
+
+	clk_prepare(u->clk);
+	return 0;
+}
+
 static int sprd_probe(struct platform_device *pdev)
 {
 	struct resource *res;
 	struct uart_port *up;
-	struct clk *clk;
 	int irq;
 	int index;
 	int ret;
@@ -715,9 +784,7 @@ static int sprd_probe(struct platform_device *pdev)
 	up->ops = &serial_sprd_ops;
 	up->flags = UPF_BOOT_AUTOCONF;
 
-	clk = devm_clk_get(&pdev->dev, NULL);
-	if (!IS_ERR_OR_NULL(clk))
-		up->uartclk = clk_get_rate(clk);
+	sprd_clk_init(up);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
@@ -752,7 +819,6 @@ static int sprd_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, up);
-
 	return ret;
 }
 
@@ -780,6 +846,7 @@ static SIMPLE_DEV_PM_OPS(sprd_pm_ops, sprd_suspend, sprd_resume);
 
 static const struct of_device_id serial_ids[] = {
 	{.compatible = "sprd,sc9836-uart",},
+	{.compatible = "sprd,sc9838-uart",},
 	{}
 };
 MODULE_DEVICE_TABLE(of, serial_ids);
