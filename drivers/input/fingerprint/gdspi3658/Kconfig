@@ -1,0 +1,7 @@
+if INPUT_FINGERPRINT
+config GOODIX3658_FINGERPRINT
+	tristate "Goodix3658 fingerprint driver"
+	default n
+	help
+	add support for goodix fingerprint driver.
+endif
