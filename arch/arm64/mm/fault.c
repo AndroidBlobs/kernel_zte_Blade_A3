@@ -41,6 +41,10 @@
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
 
+#ifdef CONFIG_BOOST_SIGKILL_FREE
+#include <linux/boost_sigkill_free.h>
+#endif
+
 static const char *fault_name(unsigned int esr);
 
 /*
@@ -133,6 +137,11 @@ int ptep_set_access_flags(struct vm_area_struct *vma,
 }
 #endif
 
+static bool is_el1_instruction_abort(unsigned int esr)
+{
+	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_CUR;
+}
+
 /*
  * The kernel tried to access some page that wasn't present.
  */
@@ -141,8 +150,9 @@ static void __do_kernel_fault(struct mm_struct *mm, unsigned long addr,
 {
 	/*
 	 * Are we prepared to handle this kernel fault?
+	 * We are almost certainly not prepared to handle instruction faults.
 	 */
-	if (fixup_exception(regs))
+	if (!is_el1_instruction_abort(esr) && fixup_exception(regs))
 		return;
 
 	/*
@@ -204,14 +214,21 @@ static void do_bad_area(unsigned long addr, unsigned int esr, struct pt_regs *re
 #define VM_FAULT_BADMAP		0x010000
 #define VM_FAULT_BADACCESS	0x020000
 
-#define ESR_LNX_EXEC		(1 << 24)
-
 static int __do_page_fault(struct mm_struct *mm, unsigned long addr,
 			   unsigned int mm_flags, unsigned long vm_flags,
 			   struct task_struct *tsk)
 {
 	struct vm_area_struct *vma;
 	int fault;
+
+#ifdef CONFIG_BOOST_SIGKILL_FREE
+	if (unlikely(test_bit(MMF_FAST_FREEING, &mm->flags))) {
+		task_clear_jobctl_pending(tsk, JOBCTL_PENDING_MASK);
+		sigaddset(&tsk->pending.signal, SIGKILL);
+		set_tsk_thread_flag(tsk, TIF_SIGPENDING);
+		return VM_FAULT_BADMAP;
+	}
+#endif
 
 	vma = find_vma(mm, addr);
 	fault = VM_FAULT_BADMAP;
@@ -244,6 +261,26 @@ out:
 	return fault;
 }
 
+static inline bool is_permission_fault(unsigned int esr, struct pt_regs *regs)
+{
+	unsigned int ec       = ESR_ELx_EC(esr);
+	unsigned int fsc_type = esr & ESR_ELx_FSC_TYPE;
+
+	if (ec != ESR_ELx_EC_DABT_CUR && ec != ESR_ELx_EC_IABT_CUR)
+		return false;
+
+	if (system_uses_ttbr0_pan())
+		return fsc_type == ESR_ELx_FSC_FAULT &&
+			(regs->pstate & PSR_PAN_BIT);
+	else
+		return fsc_type == ESR_ELx_FSC_PERM;
+}
+
+static bool is_el0_instruction_abort(unsigned int esr)
+{
+	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW;
+}
+
 static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 				   struct pt_regs *regs)
 {
@@ -270,19 +307,24 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 	if (user_mode(regs))
 		mm_flags |= FAULT_FLAG_USER;
 
-	if (esr & ESR_LNX_EXEC) {
+	if (is_el0_instruction_abort(esr)) {
 		vm_flags = VM_EXEC;
 	} else if ((esr & ESR_ELx_WNR) && !(esr & ESR_ELx_CM)) {
 		vm_flags = VM_WRITE;
 		mm_flags |= FAULT_FLAG_WRITE;
 	}
 
-	/*
-	 * PAN bit set implies the fault happened in kernel space, but not
-	 * in the arch's user access functions.
-	 */
-	if (IS_ENABLED(CONFIG_ARM64_PAN) && (regs->pstate & PSR_PAN_BIT))
-		goto no_context;
+	if (addr < USER_DS && is_permission_fault(esr, regs)) {
+		/* regs->orig_addr_limit may be 0 if we entered from EL0 */
+		if (regs->orig_addr_limit == KERNEL_DS)
+			die("Accessing user space memory with fs=KERNEL_DS", regs, esr);
+
+		if (is_el1_instruction_abort(esr))
+			die("Attempting to execute userspace memory", regs, esr);
+
+		if (!search_exception_tables(regs->pc))
+			die("Accessing user space memory outside uaccess.h routines", regs, esr);
+	}
 
 	/*
 	 * As per x86, we may deadlock here. However, since the kernel only
@@ -431,7 +473,24 @@ static int do_bad(unsigned long addr, unsigned int esr, struct pt_regs *regs)
 	return 1;
 }
 
-static struct fault_info {
+#ifdef CONFIG_SPRD_WHALE2_ISP_REGISTER_ACCESS_RETRY
+/*
+ * This workround whale2 ISP(ARC) access register bug.
+ */
+int in_altek_isp_ahb_range(unsigned long addr);
+static int do_whale2isp_fault(unsigned long addr, unsigned int esr,
+			      struct pt_regs *regs)
+{
+	if (in_altek_isp_ahb_range(addr)) {
+		pr_alert ("whale2 ISP Unhandled fault:(0x%08x) at 0x%016lx\n",
+			   esr, addr);
+		return 0;
+	} else
+		return 1;
+}
+#endif
+
+static const struct fault_info {
 	int	(*fn)(unsigned long addr, unsigned int esr, struct pt_regs *regs);
 	int	sig;
 	int	code;
@@ -453,7 +512,11 @@ static struct fault_info {
 	{ do_page_fault,	SIGSEGV, SEGV_ACCERR,	"level 1 permission fault"	},
 	{ do_page_fault,	SIGSEGV, SEGV_ACCERR,	"level 2 permission fault"	},
 	{ do_page_fault,	SIGSEGV, SEGV_ACCERR,	"level 3 permission fault"	},
+#ifdef CONFIG_SPRD_WHALE2_ISP_REGISTER_ACCESS_RETRY
+	{ do_whale2isp_fault,	SIGBUS,  0,		"synchronous external abort"	},
+#else
 	{ do_bad,		SIGBUS,  0,		"synchronous external abort"	},
+#endif
 	{ do_bad,		SIGBUS,  0,		"unknown 17"			},
 	{ do_bad,		SIGBUS,  0,		"unknown 18"			},
 	{ do_bad,		SIGBUS,  0,		"unknown 19"			},
@@ -591,20 +654,33 @@ asmlinkage int __exception do_debug_exception(unsigned long addr,
 {
 	const struct fault_info *inf = debug_fault_info + DBG_ESR_EVT(esr);
 	struct siginfo info;
+	int rv;
 
-	if (!inf->fn(addr, esr, regs))
-		return 1;
+	/*
+	 * Tell lockdep we disabled irqs in entry.S. Do nothing if they were
+	 * already disabled to preserve the last enabled/disabled addresses.
+	 */
+	if (interrupts_enabled(regs))
+		trace_hardirqs_off();
 
-	pr_alert("Unhandled debug exception: %s (0x%08x) at 0x%016lx\n",
-		 inf->name, esr, addr);
+	if (!inf->fn(addr, esr, regs)) {
+		rv = 1;
+	} else {
+		pr_alert("Unhandled debug exception: %s (0x%08x) at 0x%016lx\n",
+			 inf->name, esr, addr);
 
-	info.si_signo = inf->sig;
-	info.si_errno = 0;
-	info.si_code  = inf->code;
-	info.si_addr  = (void __user *)addr;
-	arm64_notify_die("", regs, &info, 0);
+		info.si_signo = inf->sig;
+		info.si_errno = 0;
+		info.si_code  = inf->code;
+		info.si_addr  = (void __user *)addr;
+		arm64_notify_die("", regs, &info, 0);
+		rv = 0;
+	}
 
-	return 0;
+	if (interrupts_enabled(regs))
+		trace_hardirqs_on();
+
+	return rv;
 }
 
 #ifdef CONFIG_ARM64_PAN
@@ -621,3 +697,17 @@ int cpu_enable_pan(void *__unused)
 	return 0;
 }
 #endif /* CONFIG_ARM64_PAN */
+
+#ifdef CONFIG_ARM64_UAO
+/*
+ * Kernel threads have fs=KERNEL_DS by default, and don't need to call
+ * set_fs(), devtmpfs in particular relies on this behaviour.
+ * We need to enable the feature at runtime (instead of adding it to
+ * PSR_MODE_EL1h) as the feature may not be implemented by the cpu.
+ */
+int cpu_enable_uao(void *__unused)
+{
+	asm(SET_PSTATE_UAO(1));
+	return 0;
+}
+#endif /* CONFIG_ARM64_UAO */

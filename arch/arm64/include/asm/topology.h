@@ -12,6 +12,9 @@ struct cpu_topology {
 };
 
 extern struct cpu_topology cpu_topology[NR_CPUS];
+#ifdef CONFIG_64BIT_ONLY_CPU
+extern u64 __cpu_logical_map[NR_CPUS];
+#endif
 
 #define topology_physical_package_id(cpu)	(cpu_topology[cpu].cluster_id)
 #define topology_core_id(cpu)		(cpu_topology[cpu].core_id)
@@ -21,6 +24,17 @@ extern struct cpu_topology cpu_topology[NR_CPUS];
 void init_cpu_topology(void);
 void store_cpu_topology(unsigned int cpuid);
 const struct cpumask *cpu_coregroup_mask(int cpu);
+
+struct sched_domain;
+#ifdef CONFIG_CPU_FREQ
+#define arch_scale_freq_capacity cpufreq_scale_freq_capacity
+extern unsigned long cpufreq_scale_freq_capacity(struct sched_domain *sd, int cpu);
+extern unsigned long cpufreq_scale_max_freq_capacity(int cpu);
+#endif
+#ifndef CONFIG_64BIT_ONLY_CPU
+#define arch_scale_cpu_capacity scale_cpu_capacity
+extern unsigned long scale_cpu_capacity(struct sched_domain *sd, int cpu);
+#endif
 
 #include <asm-generic/topology.h>
 

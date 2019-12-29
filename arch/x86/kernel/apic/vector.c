@@ -20,6 +20,8 @@
 #include <asm/i8259.h>
 #include <asm/desc.h>
 #include <asm/irq_remapping.h>
+#include <asm/mv/mv_vpic.h>
+#include <asm/mv/mobilevisor.h>
 
 struct apic_chip_data {
 	struct irq_cfg		cfg;
@@ -663,6 +665,12 @@ void irq_force_complete_move(struct irq_desc *desc)
 	struct apic_chip_data *data;
 	struct irq_cfg *cfg;
 	unsigned int cpu;
+	struct irq_domain *vector_domain = x86_vector_domain;
+
+#ifdef CONFIG_MOBILEVISOR
+	if (is_x86_mobilevisor())
+		vector_domain = mv_vpic_get_domain();
+#endif
 
 	/*
 	 * The function is called for all descriptors regardless of which
@@ -673,7 +681,7 @@ void irq_force_complete_move(struct irq_desc *desc)
 	 * Check first that the chip_data is what we expect
 	 * (apic_chip_data) before touching it any further.
 	 */
-	irqdata = irq_domain_get_irq_data(x86_vector_domain,
+	irqdata = irq_domain_get_irq_data(vector_domain,
 					  irq_desc_get_irq(desc));
 	if (!irqdata)
 		return;

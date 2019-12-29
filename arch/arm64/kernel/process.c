@@ -45,9 +45,14 @@
 #include <linux/personality.h>
 #include <linux/notifier.h>
 #include <trace/events/power.h>
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+#include <linux/percpu.h>
+#endif
 
+#include <asm/alternative.h>
 #include <asm/compat.h>
 #include <asm/cacheflush.h>
+#include <asm/exec.h>
 #include <asm/fpsimd.h>
 #include <asm/mmu_context.h>
 #include <asm/processor.h>
@@ -66,6 +71,7 @@ void (*pm_power_off)(void);
 EXPORT_SYMBOL_GPL(pm_power_off);
 
 void (*arm_pm_restart)(enum reboot_mode reboot_mode, const char *cmd);
+void (*arm_pm_restart_prepare)(const char *cmd);
 
 /*
  * This is our default idle handler.
@@ -140,6 +146,8 @@ void machine_power_off(void)
  */
 void machine_restart(char *cmd)
 {
+	if (arm_pm_restart_prepare)
+		arm_pm_restart_prepare(cmd);
 	/* Disable interrupts first */
 	local_irq_disable();
 	smp_send_stop();
@@ -162,6 +170,70 @@ void machine_restart(char *cmd)
 	 */
 	printk("Reboot failed -- System halted\n");
 	while (1);
+}
+
+/*
+ * dump a block of kernel memory from around the given address
+ */
+static void show_data(unsigned long addr, int nbytes, const char *name)
+{
+	int	i, j;
+	int	nlines;
+	u32	*p;
+
+	/*
+	 * don't attempt to dump non-kernel addresses or
+	 * values that are probably just small negative numbers
+	 */
+	if (addr < KIMAGE_VADDR || addr > -256UL)
+		return;
+
+	printk("\n%s: %#lx:\n", name, addr);
+
+	/*
+	 * round address down to a 32 bit boundary
+	 * and always dump a multiple of 32 bytes
+	 */
+	p = (u32 *)(addr & ~(sizeof(u32) - 1));
+	nbytes += (addr & (sizeof(u32) - 1));
+	nlines = (nbytes + 31) / 32;
+
+
+	for (i = 0; i < nlines; i++) {
+		/*
+		 * just display low 16 bits of address to keep
+		 * each line of the dump < 80 characters
+		 */
+		printk("%04lx ", (unsigned long)p & 0xffff);
+		for (j = 0; j < 8; j++) {
+			u32	data;
+			if (probe_kernel_address(p, data)) {
+				printk(" ********");
+			} else {
+				printk(" %08x", data);
+			}
+			++p;
+		}
+		printk("\n");
+	}
+}
+
+static void show_extra_register_data(struct pt_regs *regs, int nbytes)
+{
+	mm_segment_t fs;
+	unsigned int i;
+
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	show_data(regs->pc - nbytes, nbytes * 2, "PC");
+	show_data(regs->regs[30] - nbytes, nbytes * 2, "LR");
+	show_data(regs->sp - nbytes, nbytes * 2, "SP");
+	for (i = 0; i < 30; i++) {
+		char name[4];
+		snprintf(name, sizeof(name), "X%u", i);
+		show_data(regs->regs[i] - nbytes, nbytes * 2, name);
+	}
+	set_fs(fs);
 }
 
 void __show_regs(struct pt_regs *regs)
@@ -190,6 +262,8 @@ void __show_regs(struct pt_regs *regs)
 		if (i % 2 == 0)
 			printk("\n");
 	}
+	if (!user_mode(regs))
+		show_extra_register_data(regs, 128);
 	printk("\n");
 }
 
@@ -210,7 +284,7 @@ static void tls_thread_flush(void)
 {
 	asm ("msr tpidr_el0, xzr");
 
-	if (is_compat_task()) {
+	if (is_a32_compat_task()) {
 		current->thread.tp_value = 0;
 
 		/*
@@ -280,6 +354,9 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	} else {
 		memset(childregs, 0, sizeof(struct pt_regs));
 		childregs->pstate = PSR_MODE_EL1h;
+		if (IS_ENABLED(CONFIG_ARM64_UAO) &&
+		    cpus_have_cap(ARM64_HAS_UAO))
+			childregs->pstate |= PSR_UAO_BIT;
 		p->thread.cpu_context.x19 = stack_start;
 		p->thread.cpu_context.x20 = stk_sz;
 	}
@@ -308,6 +385,40 @@ static void tls_thread_switch(struct task_struct *next)
 	: : "r" (tpidr), "r" (tpidrro));
 }
 
+#if defined(CONFIG_SPRD_CPU_USAGE) && defined(CONFIG_SPRD_DEBUG)
+extern void sprd_update_cpu_usage(struct task_struct *prev,
+				  struct task_struct *next);
+#else
+#define sprd_update_cpu_usage(prev, next)
+#endif
+
+/* Restore the UAO state depending on next's addr_limit */
+void uao_thread_switch(struct task_struct *next)
+{
+	if (IS_ENABLED(CONFIG_ARM64_UAO)) {
+		if (task_thread_info(next)->addr_limit == KERNEL_DS)
+			asm(ALTERNATIVE("nop", SET_PSTATE_UAO(1), ARM64_HAS_UAO));
+		else
+			asm(ALTERNATIVE("nop", SET_PSTATE_UAO(0), ARM64_HAS_UAO));
+	}
+}
+
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+/*
+ * We store our current task in sp_el0, which is clobbered by userspace. Keep a
+ * shadow copy so that we can restore this upon entry from userspace.
+ *
+ * This is *only* for exception entry from EL0, and is not valid until we
+ * __switch_to() a user task.
+ */
+DEFINE_PER_CPU(struct task_struct *, __entry_task);
+
+static void entry_task_switch(struct task_struct *next)
+{
+	__this_cpu_write(__entry_task, next);
+}
+#endif
+
 /*
  * Thread switching.
  */
@@ -320,6 +431,11 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	tls_thread_switch(next);
 	hw_breakpoint_thread_switch(next);
 	contextidr_thread_switch(next);
+	sprd_update_cpu_usage(prev, next);
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	entry_task_switch(next);
+#endif
+	uao_thread_switch(next);
 
 	/*
 	 * Complete any pending TLB or cache maintenance on this CPU in case
@@ -336,24 +452,35 @@ struct task_struct *__switch_to(struct task_struct *prev,
 unsigned long get_wchan(struct task_struct *p)
 {
 	struct stackframe frame;
-	unsigned long stack_page;
+	unsigned long stack_page, ret = 0;
 	int count = 0;
 	if (!p || p == current || p->state == TASK_RUNNING)
+		return 0;
+
+	stack_page = (unsigned long)try_get_task_stack(p);
+	if (!stack_page)
 		return 0;
 
 	frame.fp = thread_saved_fp(p);
 	frame.sp = thread_saved_sp(p);
 	frame.pc = thread_saved_pc(p);
-	stack_page = (unsigned long)task_stack_page(p);
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+	frame.graph = p->curr_ret_stack;
+#endif
 	do {
 		if (frame.sp < stack_page ||
 		    frame.sp >= stack_page + THREAD_SIZE ||
-		    unwind_frame(&frame))
-			return 0;
-		if (!in_sched_functions(frame.pc))
-			return frame.pc;
+		    unwind_frame(p, &frame))
+			goto out;
+		if (!in_sched_functions(frame.pc)) {
+			ret = frame.pc;
+			goto out;
+		}
 	} while (count ++ < 16);
-	return 0;
+
+out:
+	put_task_stack(p);
+	return ret;
 }
 
 unsigned long arch_align_stack(unsigned long sp)
@@ -363,13 +490,34 @@ unsigned long arch_align_stack(unsigned long sp)
 	return sp & ~0xf;
 }
 
-static unsigned long randomize_base(unsigned long base)
+unsigned long arch_randomize_brk(struct mm_struct *mm)
 {
+	unsigned long base = mm->brk;
 	unsigned long range_end = base + (STACK_RND_MASK << PAGE_SHIFT) + 1;
+	unsigned long max_stack, range_limit;
+	/*
+	 * Determine how much room do we need to leave available for the stack.
+	 * We limit this to a reasonable value, because extremely large or
+	 * unlimited stacks are always going to bump up against brk at some
+	 * point and we don't want to fail to randomise brk in those cases.
+	 */
+	max_stack = rlimit(RLIMIT_STACK);
+	if (max_stack > SZ_128M)
+		max_stack = SZ_128M;
+
+	range_limit = mm->start_stack - max_stack - 1;
+	if (range_end > range_limit)
+		range_end = range_limit;
+
 	return randomize_range(base, range_end, 0) ? : base;
 }
 
-unsigned long arch_randomize_brk(struct mm_struct *mm)
+void arch_cpu_idle_enter(void)
 {
-	return randomize_base(mm->brk);
+	idle_notifier_call_chain(IDLE_START);
+}
+
+void arch_cpu_idle_exit(void)
+{
+	idle_notifier_call_chain(IDLE_END);
 }

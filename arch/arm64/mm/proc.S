@@ -23,12 +23,9 @@
 #include <asm/assembler.h>
 #include <asm/asm-offsets.h>
 #include <asm/hwcap.h>
-#include <asm/pgtable-hwdef.h>
 #include <asm/pgtable.h>
 #include <asm/cpufeature.h>
 #include <asm/alternative.h>
-
-#include "proc-macros.S"
 
 #ifdef CONFIG_ARM64_64K_PAGES
 #define TCR_TG_FLAGS	TCR_TG0_64K | TCR_TG1_64K
@@ -74,12 +71,15 @@ ENTRY(cpu_do_suspend)
 	mrs	x10, mdscr_el1
 	mrs	x11, oslsr_el1
 	mrs	x12, sctlr_el1
+	mrs	x13, tpidr_el1
+	mrs	x14, sp_el0
 	stp	x2, x3, [x0]
 	stp	x4, x5, [x0, #16]
 	stp	x6, x7, [x0, #32]
 	stp	x8, x9, [x0, #48]
 	stp	x10, x11, [x0, #64]
-	str	x12, [x0, #80]
+	stp	x12, x13, [x0, #80]
+	str	x14, [x0, #96]
 	ret
 ENDPROC(cpu_do_suspend)
 
@@ -92,6 +92,9 @@ ENDPROC(cpu_do_suspend)
  * Returns:
  *	sctlr_el1 value in x0
  */
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
 ENTRY(cpu_do_resume)
 	/*
 	 * Invalidate local tlb entries before turning on MMU
@@ -100,20 +103,60 @@ ENTRY(cpu_do_resume)
 	ldp	x2, x3, [x0]
 	ldp	x4, x5, [x0, #16]
 	ldp	x6, x7, [x0, #32]
+
 	ldp	x8, x9, [x0, #48]
 	ldp	x10, x11, [x0, #64]
-	ldr	x12, [x0, #80]
+	ldp	x12, x13, [x0, #80]
+	ldr	x14, [x0, #96]
 	msr	tpidr_el0, x2
+
 	msr	tpidrro_el0, x3
 	msr	contextidr_el1, x4
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+	nop
+#endif
+
 	msr	mair_el1, x5
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+	nop
+	nop
+#endif
+
 	msr	cpacr_el1, x6
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	nop
+	nop
+	nop
+#endif
+
 	msr	ttbr0_el1, x1
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+	nop
+	nop
+#endif
+
 	msr	ttbr1_el1, x7
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+#endif
+
 	tcr_set_idmap_t0sz x8, x7
+
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
 	msr	tcr_el1, x8
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+#endif
+
 	msr	vbar_el1, x9
 	msr	mdscr_el1, x10
+	msr	tpidr_el1, x13
+	msr	sp_el0, x14
 	/*
 	 * Restore oslsr_el1 by writing oslar_el1
 	 */
@@ -137,22 +180,52 @@ ENDPROC(cpu_do_resume)
 ENTRY(cpu_do_switch_mm)
 	mmid	x1, x1				// get mm->context.id
 	bfi	x0, x1, #48, #16		// set the ASID
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
 	msr	ttbr0_el1, x0			// set TTBR0
 	isb
-alternative_if_not ARM64_WORKAROUND_CAVIUM_27456
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	nop
+	nop
+#endif
+	post_ttbr0_update_workaround
 	ret
-	nop
-	nop
-	nop
-alternative_else
-	ic	iallu
-	dsb	nsh
-	isb
-	ret
-alternative_endif
 ENDPROC(cpu_do_switch_mm)
 
-	.section ".text.init", #alloc, #execinstr
+	.pushsection ".idmap.text", "ax"
+/*
+ * void idmap_cpu_replace_ttbr1(phys_addr_t new_pgd)
+ *
+ * This is the low-level counterpart to cpu_replace_ttbr1, and should not be
+ * called by anything else. It can only be executed from a TTBR0 mapping.
+ */
+ENTRY(idmap_cpu_replace_ttbr1)
+	mrs	x2, daif
+	msr	daifset, #0xf
+
+	adrp	x1, empty_zero_page
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
+	msr	ttbr1_el1, x1
+	isb
+
+	tlbi	vmalle1
+	dsb	nsh
+	isb
+
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
+	msr	ttbr1_el1, x0
+	isb
+
+	msr	daif, x2
+
+	ret
+ENDPROC(idmap_cpu_replace_ttbr1)
+	.popsection
 
 /*
  *	__cpu_setup
@@ -189,7 +262,15 @@ ENTRY(__cpu_setup)
 		     MAIR(0x44, MT_NORMAL_NC) | \
 		     MAIR(0xff, MT_NORMAL) | \
 		     MAIR(0xbb, MT_NORMAL_WT)
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
 	msr	mair_el1, x5
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+	nop
+	nop
+#endif
 	/*
 	 * Prepare SCTLR
 	 */
@@ -225,7 +306,15 @@ ENTRY(__cpu_setup)
 1:	orr	x10, x10, #TCR_HA		// hardware Access flag update
 2:
 #endif	/* CONFIG_ARM64_HW_AFDBM */
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	.align 6
+#endif
 	msr	tcr_el1, x10
+#ifdef CONFIG_SPRD_ERRATUM_JAVELIN_MMUREG
+	isb
+	nop
+	nop
+#endif
 	ret					// return to head.S
 ENDPROC(__cpu_setup)
 

@@ -178,11 +178,21 @@ static void cpa_flush_range(unsigned long start, int numpages, int cache)
 {
 	unsigned int i, level;
 	unsigned long addr;
+#ifdef CONFIG_X86_C6_TLB_IPI_OPT
+	cpumask_t cpus_not_c6;
+#endif
 
 	BUG_ON(irqs_disabled());
 	WARN_ON(PAGE_ALIGN(start) != start);
 
+#ifdef CONFIG_X86_C6_TLB_IPI_OPT
+	/* C6 explicitly flush the TLBs */
+	cpumask_clear(&cpus_not_c6);
+	set_cpumask_not_c6(&cpus_not_c6);
+	on_each_cpu_mask(&cpus_not_c6, __cpa_flush_range, NULL, 1);
+#else
 	on_each_cpu(__cpa_flush_range, NULL, 1);
+#endif
 
 	if (!cache)
 		return;
@@ -209,10 +219,25 @@ static void cpa_flush_array(unsigned long *start, int numpages, int cache,
 {
 	unsigned int i, level;
 	unsigned long do_wbinvd = cache && numpages >= 1024; /* 4M threshold */
+#ifdef CONFIG_X86_C6_TLB_IPI_OPT
+	cpumask_t cpus_not_c6;
+#endif
 
 	BUG_ON(irqs_disabled());
 
+#ifdef CONFIG_X86_C6_TLB_IPI_OPT
+	if (unlikely(do_wbinvd))
+		on_each_cpu(__cpa_flush_all, (void *) do_wbinvd, 1);
+	else {
+		/* C6 explicitly flush the TLBs */
+		cpumask_clear(&cpus_not_c6);
+		set_cpumask_not_c6(&cpus_not_c6);
+		on_each_cpu_mask(&cpus_not_c6, __cpa_flush_all,
+				(void *) do_wbinvd, 1);
+	}
+#else
 	on_each_cpu(__cpa_flush_all, (void *) do_wbinvd, 1);
+#endif
 
 	if (!cache || do_wbinvd)
 		return;
@@ -278,7 +303,7 @@ static inline pgprot_t static_protections(pgprot_t prot, unsigned long address,
 		   __pa_symbol(__end_rodata) >> PAGE_SHIFT))
 		pgprot_val(forbidden) |= _PAGE_RW;
 
-#if defined(CONFIG_X86_64) && defined(CONFIG_DEBUG_RODATA)
+#if defined(CONFIG_X86_64)
 	/*
 	 * Once the kernel maps the text as RO (kernel_set_to_readonly is set),
 	 * kernel text mappings for the large page aligned text, rodata sections
@@ -1413,7 +1438,9 @@ static int change_page_attr_set_clr(unsigned long *addr, int numpages,
 	/* Must avoid aliasing mappings in the highmem code */
 	kmap_flush_unused();
 
-	vm_unmap_aliases();
+	/* SELFSNOOP support cache type aliasing */
+	if (!cpu_has_ss)
+		vm_unmap_aliases();
 
 	cpa.vaddr = addr;
 	cpa.pages = pages;
@@ -1535,6 +1562,7 @@ static int _set_memory_array(unsigned long *addr, int addrinarray,
 	enum page_cache_mode set_type;
 	int i, j;
 	int ret;
+	bool ss = cpu_has_ss;
 
 	for (i = 0; i < addrinarray; i++) {
 		ret = reserve_memtype(__pa(addr[i]), __pa(addr[i]) + PAGE_SIZE,
@@ -1543,14 +1571,14 @@ static int _set_memory_array(unsigned long *addr, int addrinarray,
 			goto out_free;
 	}
 
-	/* If WC, set to UC- first and then WC */
-	set_type = (new_type == _PAGE_CACHE_MODE_WC) ?
+	/* If WC, set to UC- first and then WC, only for !cpu_has_ss */
+	set_type = (!ss && new_type == _PAGE_CACHE_MODE_WC) ?
 				_PAGE_CACHE_MODE_UC_MINUS : new_type;
 
 	ret = change_page_attr_set(addr, addrinarray,
 				   cachemode2pgprot(set_type), 1);
 
-	if (!ret && new_type == _PAGE_CACHE_MODE_WC)
+	if (!ret && !ss && new_type == _PAGE_CACHE_MODE_WC)
 		ret = change_page_attr_set_clr(addr, addrinarray,
 					       cachemode2pgprot(
 						_PAGE_CACHE_MODE_WC),
@@ -1591,16 +1619,18 @@ int _set_memory_wc(unsigned long addr, int numpages)
 	int ret;
 	unsigned long addr_copy = addr;
 
-	ret = change_page_attr_set(&addr, numpages,
-				   cachemode2pgprot(_PAGE_CACHE_MODE_UC_MINUS),
-				   0);
-	if (!ret) {
-		ret = change_page_attr_set_clr(&addr_copy, numpages,
-					       cachemode2pgprot(
-						_PAGE_CACHE_MODE_WC),
-					       __pgprot(_PAGE_CACHE_MASK),
-					       0, 0, NULL);
+	if (!cpu_has_ss) {
+		ret = change_page_attr_set(&addr, numpages,
+				cachemode2pgprot(_PAGE_CACHE_MODE_UC_MINUS),
+				0);
+		if (ret)
+			return ret;
 	}
+
+	ret = change_page_attr_set_clr(&addr_copy, numpages,
+				cachemode2pgprot(_PAGE_CACHE_MODE_WC),
+				 __pgprot(_PAGE_CACHE_MASK),
+				0, 0, NULL);
 	return ret;
 }
 
@@ -1729,6 +1759,14 @@ int set_pages_uc(struct page *page, int numpages)
 }
 EXPORT_SYMBOL(set_pages_uc);
 
+int set_pages_wc(struct page *page, int numpages)
+{
+	unsigned long addr = (unsigned long)page_address(page);
+
+	return set_memory_wc(addr, numpages);
+}
+EXPORT_SYMBOL_GPL(set_pages_wc);
+
 static int _set_pages_array(struct page **pages, int addrinarray,
 		enum page_cache_mode new_type)
 {
@@ -1738,6 +1776,7 @@ static int _set_pages_array(struct page **pages, int addrinarray,
 	int i;
 	int free_idx;
 	int ret;
+	bool ss = cpu_has_ss;
 
 	for (i = 0; i < addrinarray; i++) {
 		if (PageHighMem(pages[i]))
@@ -1748,13 +1787,13 @@ static int _set_pages_array(struct page **pages, int addrinarray,
 			goto err_out;
 	}
 
-	/* If WC, set to UC- first and then WC */
-	set_type = (new_type == _PAGE_CACHE_MODE_WC) ?
+	/* If WC, set to UC- first and then WC, only for !cpu_has_ss */
+	set_type = (!ss && new_type == _PAGE_CACHE_MODE_WC) ?
 				_PAGE_CACHE_MODE_UC_MINUS : new_type;
 
 	ret = cpa_set_pages_array(pages, addrinarray,
 				  cachemode2pgprot(set_type));
-	if (!ret && new_type == _PAGE_CACHE_MODE_WC)
+	if (!ret && !ss && new_type == _PAGE_CACHE_MODE_WC)
 		ret = change_page_attr_set_clr(NULL, addrinarray,
 					       cachemode2pgprot(
 						_PAGE_CACHE_MODE_WC),

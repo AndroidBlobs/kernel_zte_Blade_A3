@@ -32,6 +32,7 @@
 #include <linux/initrd.h>
 #include <linux/bootmem.h>
 #include <linux/memblock.h>
+#include <linux/of_fdt.h>
 #include <linux/seq_file.h>
 #include <linux/console.h>
 #include <linux/root_dev.h>
@@ -880,8 +881,6 @@ void __init setup_arch(char **cmdline_p)
 	 * so proper operation is guaranteed.
 	 */
 	__flush_tlb_all();
-#else
-	printk(KERN_INFO "Command line: %s\n", boot_command_line);
 #endif
 
 	/*
@@ -936,6 +935,8 @@ void __init setup_arch(char **cmdline_p)
 	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
 	setup_memory_map();
 	parse_setup_data();
+
+	x86_setup_dtb();
 
 	copy_edd();
 
@@ -1091,6 +1092,8 @@ void __init setup_arch(char **cmdline_p)
 
 	memblock_set_current_limit(ISA_END_ADDRESS);
 	memblock_x86_fill();
+
+	early_init_fdt_scan_reserved_mem();
 
 	if (efi_enabled(EFI_BOOT)) {
 		efi_fake_memmap();

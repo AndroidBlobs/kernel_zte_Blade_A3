@@ -31,7 +31,8 @@
 #include <asm/tlbflush.h>
 #include <asm/mce.h>
 #include <asm/vm86.h>
-
+#include <asm/mv/mobilevisor.h>
+#include <asm/mv/mv_gal.h>
 /*
  * per-CPU TSS segments. Threads are completely 'soft' on Linux,
  * no more per-task TSS's. The TSS size is kept cacheline-aligned
@@ -62,19 +63,6 @@ EXPORT_PER_CPU_SYMBOL(cpu_tss);
 
 #ifdef CONFIG_X86_64
 static DEFINE_PER_CPU(unsigned char, is_idle);
-static ATOMIC_NOTIFIER_HEAD(idle_notifier);
-
-void idle_notifier_register(struct notifier_block *n)
-{
-	atomic_notifier_chain_register(&idle_notifier, n);
-}
-EXPORT_SYMBOL_GPL(idle_notifier_register);
-
-void idle_notifier_unregister(struct notifier_block *n)
-{
-	atomic_notifier_chain_unregister(&idle_notifier, n);
-}
-EXPORT_SYMBOL_GPL(idle_notifier_unregister);
 #endif
 
 /*
@@ -251,14 +239,14 @@ static inline void play_dead(void)
 void enter_idle(void)
 {
 	this_cpu_write(is_idle, 1);
-	atomic_notifier_call_chain(&idle_notifier, IDLE_START, NULL);
+	idle_notifier_call_chain(IDLE_START);
 }
 
 static void __exit_idle(void)
 {
 	if (x86_test_and_clear_bit_percpu(0, is_idle) == 0)
 		return;
-	atomic_notifier_call_chain(&idle_notifier, IDLE_END, NULL);
+	idle_notifier_call_chain(IDLE_END);
 }
 
 /* Called from interrupts to signify idle end */
@@ -325,6 +313,8 @@ void stop_this_cpu(void *dummy)
 	 * Remove this CPU:
 	 */
 	set_cpu_online(smp_processor_id(), false);
+	if (is_x86_mobilevisor())
+		mv_vcpu_stop(smp_processor_id());
 	disable_local_APIC();
 	mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
 
@@ -403,6 +393,10 @@ static int prefer_mwait_c1_over_halt(const struct cpuinfo_x86 *c)
 		return 0;
 
 	if (!cpu_has(c, X86_FEATURE_MWAIT))
+		return 0;
+
+	/* for vmm version, don't use mwait_idle */
+	if (is_x86_mobilevisor())
 		return 0;
 
 	return 1;

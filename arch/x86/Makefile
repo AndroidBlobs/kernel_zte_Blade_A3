@@ -86,6 +86,7 @@ else
         biarch := -m64
         KBUILD_AFLAGS += -m64
         KBUILD_CFLAGS += -m64
+        KBUILD_CFLAGS += -fno-pic
 
         # Align jump targets to 1 byte, not the default 16 bytes:
         KBUILD_CFLAGS += -falign-jumps=1
@@ -96,6 +97,8 @@ else
         # Don't autogenerate traditional x87 instructions
         KBUILD_CFLAGS += $(call cc-option,-mno-80387)
         KBUILD_CFLAGS += $(call cc-option,-mno-fp-ret-in-387)
+
+        KBUILD_CFLAGS += -fno-pic
 
 	# Use -mpreferred-stack-boundary=3 if supported.
 	KBUILD_CFLAGS += $(call cc-option,-mpreferred-stack-boundary=3)
@@ -229,6 +232,8 @@ drivers-$(CONFIG_FB) += arch/x86/video/
 
 drivers-$(CONFIG_RAS) += arch/x86/ras/
 
+drivers-$(CONFIG_MOBILEVISOR) += arch/x86/mobilevisor/
+
 ####
 # boot loader support. Several targets are kept for legacy purposes
 
@@ -238,8 +243,20 @@ BOOT_TARGETS = bzlilo bzdisk fdimage fdimage144 fdimage288 isoimage
 
 PHONY += bzImage $(BOOT_TARGETS)
 
+ifeq ($(CONFIG_OF),y)
+KBUILD_DTBS     := dtbs
+
+%.dtb: scripts
+	$(Q)$(MAKE) $(build)=$(boot)/dts $(boot)/dts/$@
+
+dtbs: scripts
+	$(Q)$(MAKE) $(build)=$(boot)/dts dtbs
+
+all: bzImage $(KBUILD_DTBS)
+else
 # Default kernel to build
 all: bzImage
+endif
 
 # KBUILD_IMAGE specify target image being built
 KBUILD_IMAGE := $(boot)/bzImage
@@ -267,6 +284,7 @@ archclean:
 	$(Q)rm -rf $(objtree)/arch/i386
 	$(Q)rm -rf $(objtree)/arch/x86_64
 	$(Q)$(MAKE) $(clean)=$(boot)
+	$(Q)$(MAKE) $(clean)=$(boot)/dts
 	$(Q)$(MAKE) $(clean)=arch/x86/tools
 	$(Q)$(MAKE) $(clean)=arch/x86/purgatory
 

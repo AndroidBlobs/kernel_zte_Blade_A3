@@ -76,6 +76,8 @@
 #include <asm/realmode.h>
 #include <asm/misc.h>
 
+#include <asm/mv/mobilevisor.h>
+
 /* Number of siblings per CPU package */
 int smp_num_siblings = 1;
 EXPORT_SYMBOL(smp_num_siblings);
@@ -99,11 +101,15 @@ EXPORT_PER_CPU_SYMBOL(cpu_info);
 
 static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
 {
+#ifndef CONFIG_X86_SPRD_ISOC
+	/* Remove unnecessary CMOS RTC IO for ISOC */
 	unsigned long flags;
 
 	spin_lock_irqsave(&rtc_lock, flags);
 	CMOS_WRITE(0xa, 0xf);
 	spin_unlock_irqrestore(&rtc_lock, flags);
+#endif
+
 	local_flush_tlb();
 	pr_debug("1.\n");
 	*((volatile unsigned short *)phys_to_virt(TRAMPOLINE_PHYS_HIGH)) =
@@ -116,13 +122,17 @@ static inline void smpboot_setup_warm_reset_vector(unsigned long start_eip)
 
 static inline void smpboot_restore_warm_reset_vector(void)
 {
+#ifndef CONFIG_X86_SPRD_ISOC
 	unsigned long flags;
+#endif
 
 	/*
 	 * Install writable page 0 entry to set BIOS data area.
 	 */
 	local_flush_tlb();
 
+#ifndef CONFIG_X86_SPRD_ISOC
+	/* Remove unnecessary CMOS RTC IO for ISOC */
 	/*
 	 * Paranoid:  Set warm reset code and vector here back
 	 * to default values.
@@ -130,6 +140,7 @@ static inline void smpboot_restore_warm_reset_vector(void)
 	spin_lock_irqsave(&rtc_lock, flags);
 	CMOS_WRITE(0, 0xf);
 	spin_unlock_irqrestore(&rtc_lock, flags);
+#endif
 
 	*((volatile u32 *)phys_to_virt(TRAMPOLINE_PHYS_LOW)) = 0;
 }
@@ -830,14 +841,23 @@ void common_cpu_up(unsigned int cpu, struct task_struct *idle)
  */
 static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
 {
-	volatile u32 *trampoline_status =
-		(volatile u32 *) __va(real_mode_header->trampoline_status);
+	u32 *trampoline_status;
+	u32 trampoline_status_v;
 	/* start_ip had better be page-aligned! */
-	unsigned long start_ip = real_mode_header->trampoline_start;
+	unsigned long start_ip;
 
 	unsigned long boot_error = 0;
 	int cpu0_nmi_registered = 0;
 	unsigned long timeout;
+
+	if (is_x86_mobilevisor()) {
+		trampoline_status = (u32 *)&trampoline_status_v;
+		start_ip = 0x0;
+	} else {
+		trampoline_status =
+			(u32 *) __va(real_mode_header->trampoline_status);
+		start_ip = real_mode_header->trampoline_start;
+	}
 
 	idle->thread.sp = (unsigned long) (((struct pt_regs *)
 			  (THREAD_SIZE +  task_stack_page(idle))) - 1);
@@ -865,7 +885,8 @@ static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
 
 		pr_debug("Setting warm reset code and vector.\n");
 
-		smpboot_setup_warm_reset_vector(start_ip);
+		if (!is_x86_mobilevisor()) /* Not need for VMM guest */
+			smpboot_setup_warm_reset_vector(start_ip);
 		/*
 		 * Be paranoid about clearing APIC errors.
 		*/
@@ -937,7 +958,8 @@ static int do_boot_cpu(int apicid, int cpu, struct task_struct *idle)
 		/*
 		 * Cleanup possible dangling ends...
 		 */
-		smpboot_restore_warm_reset_vector();
+		if (!is_x86_mobilevisor()) /* Not need for VMM guest */
+			smpboot_restore_warm_reset_vector();
 	}
 	/*
 	 * Clean up the nmi handler. Do this after the callin and callout sync
@@ -1018,6 +1040,9 @@ int native_cpu_up(unsigned int cpu, struct task_struct *tidle)
 		touch_nmi_watchdog();
 	}
 
+#ifdef CONFIG_HOTPLUG_CPU
+	restore_irqs_affinity();
+#endif
 	irq_unlock_sparse();
 
 	return 0;

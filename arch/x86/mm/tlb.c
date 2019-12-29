@@ -6,6 +6,7 @@
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/cpu.h>
+#include <linux/cpuidle.h>
 
 #include <asm/tlbflush.h>
 #include <asm/mmu_context.h>
@@ -289,6 +290,53 @@ static void do_kernel_range_flush(void *info)
 	/* flush range by one by one 'invlpg' */
 	for (addr = f->flush_start; addr < f->flush_end; addr += PAGE_SIZE)
 		__flush_tlb_single(addr);
+}
+
+void set_cpumask_not_c6(struct cpumask *cpus_not_c6)
+{
+	int cpu;
+	struct cpuidle_state *idle_state;
+
+	cpumask_clear(cpus_not_c6);
+
+	for_each_online_cpu(cpu) {
+		rcu_read_lock();
+		idle_state = sched_idle_get_state(cpu);
+		rcu_read_unlock();
+
+		if (!idle_state ||
+			(strncmp(idle_state->name, "C6FS", CPUIDLE_NAME_LEN) &&
+			strncmp(idle_state->name, "C6NS", CPUIDLE_NAME_LEN)))
+			cpumask_set_cpu(cpu, cpus_not_c6);
+	}
+}
+
+/*
+ * This function do the flush at no c6 cores.
+ * C6FS/C6NS explicitly flush the TLBs for SPRD ISOC project.
+ * Only use by unmap_kernel_range now.
+ * WA for video playback call function IPI issue.
+ */
+void flush_tlb_kernel_range_c6_noflush(unsigned long start,
+			unsigned long end)
+{
+	cpumask_t cpus_not_c6;
+
+	/* C6 explicitly flush the TLBs */
+	cpumask_clear(&cpus_not_c6);
+	set_cpumask_not_c6(&cpus_not_c6);
+
+	/* Balance as user space task's flush, a bit conservative */
+	if (end == TLB_FLUSH_ALL ||
+	    (end - start) > tlb_single_page_flush_ceiling * PAGE_SIZE) {
+		on_each_cpu_mask(&cpus_not_c6, do_flush_tlb_all, NULL, 1);
+	} else {
+		struct flush_tlb_info info;
+
+		info.flush_start = start;
+		info.flush_end = end;
+		on_each_cpu_mask(&cpus_not_c6, do_kernel_range_flush, &info, 1);
+	}
 }
 
 void flush_tlb_kernel_range(unsigned long start, unsigned long end)

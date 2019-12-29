@@ -24,15 +24,6 @@
 #include <asm/ptrace.h>
 #include <asm/user.h>
 
-typedef unsigned long elf_greg_t;
-
-#define ELF_NGREG (sizeof(struct user_pt_regs) / sizeof(elf_greg_t))
-#define ELF_CORE_COPY_REGS(dest, regs)	\
-	*(struct user_pt_regs *)&(dest) = (regs)->user_regs;
-
-typedef elf_greg_t elf_gregset_t[ELF_NGREG];
-typedef struct user_fpsimd_state elf_fpregset_t;
-
 /*
  * AArch64 static relocation types.
  */
@@ -86,6 +77,8 @@ typedef struct user_fpsimd_state elf_fpregset_t;
 #define R_AARCH64_MOVW_PREL_G2_NC	292
 #define R_AARCH64_MOVW_PREL_G3		293
 
+#define R_AARCH64_RELATIVE		1027
+
 /*
  * These are used to set parameters in the core dumps.
  */
@@ -120,11 +113,23 @@ typedef struct user_fpsimd_state elf_fpregset_t;
 #define ELF_EXEC_PAGESIZE	PAGE_SIZE
 
 /*
- * This is the base location for PIE (ET_DYN with INTERP) loads. On
- * 64-bit, this is raised to 4GB to leave the entire 32-bit address
- * space open for things that want to use the area for 32-bit pointers.
+ * This is the location that an ET_DYN program is loaded if exec'ed.  Typical
+ * use of this is to invoke "./ld.so someprog" to test out a new version of
+ * the loader.  We need to make sure that it is out of the way of the program
+ * that it will "exec", and that there is sufficient room for the brk.
  */
-#define ELF_ET_DYN_BASE		0x100000000UL
+#define ELF_ET_DYN_BASE	(2 * TASK_SIZE_64 / 3)
+
+#ifndef __ASSEMBLY__
+
+typedef unsigned long elf_greg_t;
+
+#define ELF_NGREG (sizeof(struct user_pt_regs) / sizeof(elf_greg_t))
+#define ELF_CORE_COPY_REGS(dest, regs)	\
+	*(struct user_pt_regs *)&(dest) = (regs)->user_regs;
+
+typedef elf_greg_t elf_gregset_t[ELF_NGREG];
+typedef struct user_fpsimd_state elf_fpregset_t;
 
 /*
  * When the program starts, a1 contains a pointer to a function to be
@@ -133,7 +138,11 @@ typedef struct user_fpsimd_state elf_fpregset_t;
  */
 #define ELF_PLAT_INIT(_r, load_addr)	(_r)->regs[0] = 0
 
-#define SET_PERSONALITY(ex)		clear_thread_flag(TIF_32BIT);
+#define SET_PERSONALITY(ex)						\
+do {									\
+	clear_thread_flag(TIF_32BIT);					\
+	current_thread_info()->dbt_syscall = 0;				\
+} while (0)
 
 /* update AT_VECTOR_SIZE_ARCH if the number of NEW_AUX_ENT entries changes */
 #define ARCH_DLINFO							\
@@ -164,8 +173,7 @@ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 
 #ifdef CONFIG_COMPAT
 
-/* PIE load location for compat arm. Must match ARM ELF_ET_DYN_BASE. */
-#define COMPAT_ELF_ET_DYN_BASE		0x000400000UL
+#define COMPAT_ELF_ET_DYN_BASE		(2 * TASK_SIZE_32 / 3)
 
 /* AArch32 registers. */
 #define COMPAT_ELF_NGREG		18
@@ -178,7 +186,11 @@ typedef compat_elf_greg_t		compat_elf_gregset_t[COMPAT_ELF_NGREG];
 					 ((x)->e_flags & EF_ARM_EABI_MASK))
 
 #define compat_start_thread		compat_start_thread
-#define COMPAT_SET_PERSONALITY(ex)	set_thread_flag(TIF_32BIT);
+#define COMPAT_SET_PERSONALITY(ex)					\
+do {									\
+	set_thread_flag(TIF_32BIT);					\
+	current_thread_info()->dbt_syscall = 0;				\
+} while (0)
 #define COMPAT_ARCH_DLINFO
 extern int aarch32_setup_vectors_page(struct linux_binprm *bprm,
 				      int uses_interp);
@@ -186,5 +198,7 @@ extern int aarch32_setup_vectors_page(struct linux_binprm *bprm,
 					aarch32_setup_vectors_page
 
 #endif /* CONFIG_COMPAT */
+
+#endif /* !__ASSEMBLY__ */
 
 #endif

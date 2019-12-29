@@ -270,7 +270,11 @@ static void hpet_enable_legacy_int(void)
 {
 	unsigned int cfg = hpet_readl(HPET_CFG);
 
+#ifdef CONFIG_X86_DISABLE_LEGACY_PIC
+	cfg &= ~HPET_CFG_LEGACY;
+#else
 	cfg |= HPET_CFG_LEGACY;
+#endif
 	hpet_writel(cfg, HPET_CFG);
 	hpet_legacy_int_enabled = true;
 }
@@ -811,6 +815,17 @@ static int hpet_clocksource_register(void)
 
 static u32 *hpet_boot_cfg;
 
+static int __init hpet_freq_setup(char *str)
+{
+	int ret = kstrtoul(str, 0, &hpet_freq);
+
+	if (ret)
+		pr_err("invalid hpet_freq %s: err:%d\n", str, ret);
+
+	return 1;
+}
+__setup("hpet_freq=", hpet_freq_setup);
+
 /**
  * hpet_enable - Try to setup the HPET timer. Returns 1 on success.
  */
@@ -824,6 +839,10 @@ int __init hpet_enable(void)
 		return 0;
 
 	hpet_set_mapping();
+
+	/* if freq was set with command line don't calculate it */
+	if (hpet_freq)
+		goto cmdline_freq;
 
 	/*
 	 * Read the period and check for a sane value:
@@ -862,7 +881,7 @@ int __init hpet_enable(void)
 	freq = FSEC_PER_SEC;
 	do_div(freq, hpet_period);
 	hpet_freq = freq;
-
+cmdline_freq:
 	/*
 	 * Read the HPET ID register to retrieve the IRQ routing
 	 * information and the number of channels

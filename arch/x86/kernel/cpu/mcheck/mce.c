@@ -60,6 +60,9 @@ static DEFINE_MUTEX(mce_chrdev_read_mutex);
 	smp_load_acquire(&(p)); \
 })
 
+/* sysfs synchronization */
+static DEFINE_MUTEX(mce_sysfs_mutex);
+
 #define CREATE_TRACE_POINTS
 #include <trace/events/mce.h>
 
@@ -998,6 +1001,11 @@ void do_machine_check(struct pt_regs *regs, long error_code)
 	u64 recover_paddr = ~0ull;
 	int flags = MF_ACTION_REQUIRED;
 	int lmce = 0;
+
+	printk(KERN_ERR"=============MCE================\n");
+	while (1) {
+
+	}
 
 	/* If this CPU is offline, just bail out. */
 	if (cpu_is_offline(smp_processor_id())) {
@@ -2215,6 +2223,7 @@ static ssize_t set_ignore_ce(struct device *s,
 	if (kstrtou64(buf, 0, &new) < 0)
 		return -EINVAL;
 
+	mutex_lock(&mce_sysfs_mutex);
 	if (mca_cfg.ignore_ce ^ !!new) {
 		if (new) {
 			/* disable ce features */
@@ -2227,6 +2236,8 @@ static ssize_t set_ignore_ce(struct device *s,
 			on_each_cpu(mce_enable_ce, (void *)1, 1);
 		}
 	}
+	mutex_unlock(&mce_sysfs_mutex);
+
 	return size;
 }
 
@@ -2239,6 +2250,7 @@ static ssize_t set_cmci_disabled(struct device *s,
 	if (kstrtou64(buf, 0, &new) < 0)
 		return -EINVAL;
 
+	mutex_lock(&mce_sysfs_mutex);
 	if (mca_cfg.cmci_disabled ^ !!new) {
 		if (new) {
 			/* disable cmci */
@@ -2250,6 +2262,8 @@ static ssize_t set_cmci_disabled(struct device *s,
 			on_each_cpu(mce_enable_ce, NULL, 1);
 		}
 	}
+	mutex_unlock(&mce_sysfs_mutex);
+
 	return size;
 }
 
@@ -2257,8 +2271,19 @@ static ssize_t store_int_with_restart(struct device *s,
 				      struct device_attribute *attr,
 				      const char *buf, size_t size)
 {
-	ssize_t ret = device_store_int(s, attr, buf, size);
+	unsigned long old_check_interval = check_interval;
+	ssize_t ret = device_store_ulong(s, attr, buf, size);
+
+	if (check_interval == old_check_interval)
+		return ret;
+
+	if (check_interval < 1)
+		check_interval = 1;
+
+	mutex_lock(&mce_sysfs_mutex);
 	mce_restart();
+	mutex_unlock(&mce_sysfs_mutex);
+
 	return ret;
 }
 
@@ -2298,6 +2323,11 @@ static cpumask_var_t mce_device_initialized;
 static void mce_device_release(struct device *dev)
 {
 	kfree(dev);
+}
+
+static inline struct device *get_mce_device(unsigned int cpu)
+{
+	return  per_cpu(mce_device, cpu);
 }
 
 /* Per cpu device init. All of the cpus still share the same ctrl bank: */
@@ -2416,6 +2446,7 @@ mce_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
 	case CPU_DEAD:
 		if (threshold_cpu_callback)
 			threshold_cpu_callback(action, cpu);
+		dev_set_uevent_suppress(get_mce_device(cpu), true);
 		mce_device_remove(cpu);
 		mce_intel_hcpu_update(cpu);
 

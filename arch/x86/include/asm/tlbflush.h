@@ -251,6 +251,10 @@ extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 				unsigned long end, unsigned long vmflag);
 extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
 
+extern void set_cpumask_not_c6(struct cpumask *cpus_not_c6);
+extern void flush_tlb_kernel_range_c6_noflush(unsigned long start,
+				unsigned long end);
+
 #define flush_tlb()	flush_tlb_current_task()
 
 void native_flush_tlb_others(const struct cpumask *cpumask,

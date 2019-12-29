@@ -13,6 +13,7 @@ config ARM64
 	select ARCH_WANT_OPTIONAL_GPIOLIB
 	select ARCH_WANT_COMPAT_IPC_PARSE_VERSION
 	select ARCH_WANT_FRAME_POINTERS
+	select ARCH_HAS_UBSAN_SANITIZE_ALL
 	select ARM_AMBA
 	select ARM_ARCH_TIMER
 	select ARM_GIC
@@ -48,9 +49,13 @@ config ARM64
 	select HAVE_ALIGNED_STRUCT_PAGE if SLUB
 	select HAVE_ARCH_AUDITSYSCALL
 	select HAVE_ARCH_BITREVERSE
+	select HAVE_ARCH_HARDENED_USERCOPY
+	select HAVE_ARCH_HUGE_VMAP
 	select HAVE_ARCH_JUMP_LABEL
 	select HAVE_ARCH_KASAN if SPARSEMEM_VMEMMAP && !(ARM64_16K_PAGES && ARM64_VA_BITS_48)
 	select HAVE_ARCH_KGDB
+	select HAVE_ARCH_MMAP_RND_BITS
+	select HAVE_ARCH_MMAP_RND_COMPAT_BITS if COMPAT
 	select HAVE_ARCH_SECCOMP_FILTER
 	select HAVE_ARCH_TRACEHOOK
 	select HAVE_BPF_JIT
@@ -70,6 +75,7 @@ config ARM64
 	select HAVE_FUNCTION_GRAPH_TRACER
 	select HAVE_GENERIC_DMA_COHERENT
 	select HAVE_HW_BREAKPOINT if PERF_EVENTS
+	select HAVE_IRQ_TIME_ACCOUNTING
 	select HAVE_MEMBLOCK
 	select HAVE_PATA_PLATFORM
 	select HAVE_PERF_EVENTS
@@ -92,6 +98,7 @@ config ARM64
 	select SPARSE_IRQ
 	select SYSCTL_EXCEPTION_TRACE
 	select HAVE_CONTEXT_TRACKING
+	select THREAD_INFO_IN_TASK
 	help
 	  ARM 64-bit (AArch64) Linux support.
 
@@ -104,8 +111,39 @@ config ARCH_PHYS_ADDR_T_64BIT
 config MMU
 	def_bool y
 
+config ARCH_MMAP_RND_BITS_MIN
+       default 14 if ARM64_64K_PAGES
+       default 16 if ARM64_16K_PAGES
+       default 18
+
+# max bits determined by the following formula:
+#  VA_BITS - PAGE_SHIFT - 3
+config ARCH_MMAP_RND_BITS_MAX
+       default 19 if ARM64_VA_BITS=36
+       default 24 if ARM64_VA_BITS=39
+       default 27 if ARM64_VA_BITS=42
+       default 30 if ARM64_VA_BITS=47
+       default 29 if ARM64_VA_BITS=48 && ARM64_64K_PAGES
+       default 31 if ARM64_VA_BITS=48 && ARM64_16K_PAGES
+       default 33 if ARM64_VA_BITS=48
+       default 14 if ARM64_64K_PAGES
+       default 16 if ARM64_16K_PAGES
+       default 18
+
+config ARCH_MMAP_RND_COMPAT_BITS_MIN
+       default 7 if ARM64_64K_PAGES
+       default 9 if ARM64_16K_PAGES
+       default 11
+
+config ARCH_MMAP_RND_COMPAT_BITS_MAX
+       default 16
+
 config NO_IOPORT_MAP
 	def_bool y if !PCI
+
+config ILLEGAL_POINTER_VALUE
+	hex
+	default 0xdead000000000000
 
 config STACKTRACE_SUPPORT
 	def_bool y
@@ -362,6 +400,7 @@ config ARM64_ERRATUM_843419
 	bool "Cortex-A53: 843419: A load or store might access an incorrect address"
 	depends on MODULES
 	default y
+	select ARM64_MODULE_CMODEL_LARGE
 	help
 	  This option builds kernel modules using the large memory model in
 	  order to avoid the use of the ADRP instruction, which can cause
@@ -420,6 +459,38 @@ config CAVIUM_ERRATUM_27456
 	  invalidate the icache when changing the mm context.
 
 	  If unsure, say Y.
+
+config SPRD_ERRATUM_IC_IVAU
+	bool "Javelin erratum: the defect is on “IC IVAU” instruction"
+	help
+	   ARM’s “IC IVAU, [X]” instruction takes VA address into register X
+	   to invalidate the instruction cache lines in the same snoop domain.
+	   Without workaround, the pseudo code is
+	   X=VA[63:0]
+	   IC IVAU, [X]
+	   With workaround, the pseudo code is
+	   X={VA[63:2], VA[13.12]}
+	   IC IVAU, [X]
+
+config SPRD_ERRATUM_JAVELIN_MMUREG
+	bool "Javelin erratum: javelin may write wrong value to mmu registers"
+	help
+	   There are issues in javelin DCU module, when writing MMU registers,
+	   for example ttbr0_el1,ttbr1_el1,tcr_el1,mair_el1, the wrong value may
+	   be wrotten to these registers. isb and 16 bytes align is needed when
+	   writing these registers.
+
+config SPRD_ERRATUM_JAVELIN_ECO05
+	bool "Javelin erratum: FPCR register write defect"
+	help
+	   FPCR controls the FP instruction execution behaviors. Due to the
+	   defect in Javelin, the behavior change takes two cycles after
+	   MSR FPCR execution. Consequently, there could be up to 5 floating
+	   point instructions following the MSR FPSR instruction, which cannot
+	   see the side-effect of the register write. Architecturally, it is
+	   required that the very next instructions should see the
+	   aforementioned side-effect. The software workaround is to add an ISB
+	   instruction after the MSR FPCR instruction.
 
 endmenu
 
@@ -510,6 +581,40 @@ config SCHED_SMT
 	  MultiThreading at a cost of slightly increased overhead in some
 	  places. If unsure say N here.
 
+config SCHED_COMPAT_LIMIT
+	bool "(EXPERIMENTAL) has compat limit in scheduling"
+	depends on SMP
+	default n
+	help
+	  Experimental scheduler optimizations for compat limit platforms.
+	  If unsure say N here.
+
+config 32BIT_CPU_MASK
+	string "scheduler 32bit CPU mask"
+	depends on SCHED_COMPAT_LIMIT
+	default "0-1"
+	help
+	  Specify the cpuids of the 32bit CPUs in the system as a list string,
+	  e.g. cpuid 0+1 should be specified as 0-1.
+
+config 64BIT_ONLY_CPU
+	bool "AArch64 only cpu support"
+	depends on SMP
+	default n
+	help
+	  AArch64 only cpu support, design for CPU core which only support 64bit
+	  process, corresponding to some scheduler strategy, which will assgin
+	  task accordingly for better performance-power balance.
+	  If unsure say N here.
+
+config DBT
+	bool "Dynamic Binary Translation"
+	depends on COMPAT
+	default n
+	help
+	  Support dynimicly translate ARM 32-bit binary to ARM64 instructions.
+	  If unsure say N here.
+
 config NR_CPUS
 	int "Maximum number of CPUs (2-4096)"
 	range 2 4096
@@ -525,6 +630,9 @@ config HOTPLUG_CPU
 
 source kernel/Kconfig.preempt
 source kernel/Kconfig.hz
+
+config ARCH_SUPPORTS_DEBUG_PAGEALLOC
+	def_bool y
 
 config ARCH_HAS_HOLES_MEMORYMODEL
 	def_bool y if SPARSEMEM
@@ -547,9 +655,6 @@ config HW_PERF_EVENTS
 	depends on ARM_PMU
 
 config SYS_SUPPORTS_HUGETLBFS
-	def_bool y
-
-config ARCH_WANT_GENERAL_HUGETLB
 	def_bool y
 
 config ARCH_WANT_HUGE_PMD_SHARE
@@ -591,7 +696,7 @@ config FORCE_MAX_ZONEORDER
 	int
 	default "14" if (ARM64_64K_PAGES && TRANSPARENT_HUGEPAGE)
 	default "12" if (ARM64_16K_PAGES && TRANSPARENT_HUGEPAGE)
-	default "11"
+	default "12"
 	help
 	  The kernel memory allocator divides physically contiguous memory
 	  blocks into "zones", where each zone is a power of two number of
@@ -677,6 +782,14 @@ config SETEND_EMULATION
 	  If unsure, say Y
 endif
 
+config ARM64_SW_TTBR0_PAN
+	bool "Emulate Privileged Access Never using TTBR0_EL1 switching"
+	help
+	  Enabling this option prevents the kernel from accessing
+	  user-space memory directly by pointing TTBR0_EL1 to a reserved
+	  zeroed area and reserved ASID. The user access routines
+	  restore the valid TTBR0_EL1 temporarily.
+
 menu "ARMv8.1 architectural features"
 
 config ARM64_HW_AFDBM
@@ -724,9 +837,92 @@ config ARM64_LSE_ATOMICS
 
 endmenu
 
+config ARM64_UAO
+	bool "Enable support for User Access Override (UAO)"
+	default y
+	help
+	  User Access Override (UAO; part of the ARMv8.2 Extensions)
+	  causes the 'unprivileged' variant of the load/store instructions to
+	  be overriden to be privileged.
+
+	  This option changes get_user() and friends to use the 'unprivileged'
+	  variant of the load/store instructions. This ensures that user-space
+	  really did have access to the supplied memory. When addr_limit is
+	  set to kernel memory the UAO bit will be set, allowing privileged
+	  access to kernel memory.
+
+	  Choosing this option will cause copy_to_user() et al to use user-space
+	  memory permissions.
+
+	  The feature is detected at runtime, the kernel will use the
+	  regular load/store instructions if the cpu does not implement the
+	  feature.
+
+config ARM64_MODULE_CMODEL_LARGE
+	bool
+
+config ARM64_MODULE_PLTS
+	bool
+	select ARM64_MODULE_CMODEL_LARGE
+	select HAVE_MOD_ARCH_SPECIFIC
+
+config RELOCATABLE
+	bool
+	help
+	  This builds the kernel as a Position Independent Executable (PIE),
+	  which retains all relocation metadata required to relocate the
+	  kernel binary at runtime to a different virtual address than the
+	  address it was linked at.
+	  Since AArch64 uses the RELA relocation format, this requires a
+	  relocation pass at runtime even if the kernel is loaded at the
+	  same address it was linked at.
+
+config RANDOMIZE_BASE
+	bool "Randomize the address of the kernel image"
+	select ARM64_MODULE_PLTS if MODULES
+	select RELOCATABLE
+	help
+	  Randomizes the virtual address at which the kernel image is
+	  loaded, as a security feature that deters exploit attempts
+	  relying on knowledge of the location of kernel internals.
+
+	  It is the bootloader's job to provide entropy, by passing a
+	  random u64 value in /chosen/kaslr-seed at kernel entry.
+
+	  When booting via the UEFI stub, it will invoke the firmware's
+	  EFI_RNG_PROTOCOL implementation (if available) to supply entropy
+	  to the kernel proper. In addition, it will randomise the physical
+	  location of the kernel Image as well.
+
+	  If unsure, say N.
+
+config RANDOMIZE_MODULE_REGION_FULL
+	bool "Randomize the module region independently from the core kernel"
+	depends on RANDOMIZE_BASE && !DYNAMIC_FTRACE
+	default y
+	help
+	  Randomizes the location of the module region without considering the
+	  location of the core kernel. This way, it is impossible for modules
+	  to leak information about the location of core kernel data structures
+	  but it does imply that function calls between modules and the core
+	  kernel will need to be resolved via veneers in the module PLT.
+
+	  When this option is not set, the module region will be randomized over
+	  a limited range that contains the [_stext, _etext] interval of the
+	  core kernel, so branch relocations are always in range.
+
 endmenu
 
 menu "Boot options"
+
+config ARM64_ACPI_PARKING_PROTOCOL
+	bool "Enable support for the ARM64 ACPI parking protocol"
+	depends on ACPI
+	help
+	  Enable support for the ARM64 ACPI parking protocol. If disabled
+	  the kernel will not allow booting through the ARM64 ACPI parking
+	  protocol even if the corresponding data is present in the ACPI
+	  MADT table.
 
 config CMDLINE
 	string "Default kernel command string"
@@ -736,6 +932,23 @@ config CMDLINE
 	  entering them here. As a minimum, you should specify the the
 	  root device (e.g. root=/dev/nfs).
 
+choice
+	prompt "Kernel command line type" if CMDLINE != ""
+	default CMDLINE_FROM_BOOTLOADER
+
+config CMDLINE_FROM_BOOTLOADER
+	bool "Use bootloader kernel arguments if available"
+	help
+	  Uses the command-line options passed by the boot loader. If
+	  the boot loader doesn't provide any, the default kernel command
+	  string provided in CMDLINE will be used.
+
+config CMDLINE_EXTEND
+	bool "Extend bootloader kernel arguments"
+	help
+	  The command-line arguments provided by the boot loader will be
+	  appended to the default kernel command string.
+
 config CMDLINE_FORCE
 	bool "Always use the default kernel command string"
 	help
@@ -743,6 +956,7 @@ config CMDLINE_FORCE
 	  loader passes other arguments to the kernel.
 	  This is useful if you cannot or don't want to change the
 	  command-line options your boot loader passes to the kernel.
+endchoice
 
 config EFI_STUB
 	bool
@@ -774,6 +988,41 @@ config DMI
 	  This option is only useful on systems that have UEFI firmware.
 	  However, even with this option, the resultant kernel should
 	  continue to boot on existing non-UEFI platforms.
+
+config BUILD_ARM64_APPENDED_DTB_IMAGE
+	bool "Build a concatenated Image.gz/dtb by default"
+	depends on OF
+	help
+	  Enabling this option will cause a concatenated Image.gz and list of
+	  DTBs to be built by default (instead of a standalone Image.gz.)
+	  The image will built in arch/arm64/boot/Image.gz-dtb
+
+choice
+	prompt "Appended DTB Kernel Image name"
+	depends on BUILD_ARM64_APPENDED_DTB_IMAGE
+	help
+	  Enabling this option will cause a specific kernel image Image or
+	  Image.gz to be used for final image creation.
+	  The image will built in arch/arm64/boot/IMAGE-NAME-dtb
+
+	config IMG_GZ_DTB
+		bool "Image.gz-dtb"
+	config IMG_DTB
+		bool "Image-dtb"
+endchoice
+
+config BUILD_ARM64_APPENDED_KERNEL_IMAGE_NAME
+	string
+	depends on BUILD_ARM64_APPENDED_DTB_IMAGE
+	default "Image.gz-dtb" if IMG_GZ_DTB
+	default "Image-dtb" if IMG_DTB
+
+config BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES
+	string "Default dtb names"
+	depends on BUILD_ARM64_APPENDED_DTB_IMAGE
+	help
+	  Space separated list of names of dtbs to append when
+	  building a concatenated Image.gz-dtb.
 
 endmenu
 

@@ -17,6 +17,9 @@
 #include <asm/thread_info.h>
 #include <asm/cpumask.h>
 #include <asm/cpufeature.h>
+#ifdef CONFIG_INTEL_DWS
+#include <asm/topology.h>
+#endif
 
 extern int smp_num_siblings;
 extern unsigned int num_processors;
@@ -96,6 +99,9 @@ static inline void smp_prepare_boot_cpu(void)
 
 static inline void smp_prepare_cpus(unsigned int max_cpus)
 {
+#ifdef CONFIG_INTEL_DWS
+	early_init_cpu_topology();
+#endif
 	smp_ops.smp_prepare_cpus(max_cpus);
 }
 

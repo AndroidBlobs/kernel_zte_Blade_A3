@@ -37,6 +37,9 @@
 #include <linux/completion.h>
 #include <linux/of.h>
 #include <linux/irq_work.h>
+#ifdef CONFIG_TRUSTY
+#include <linux/irqdomain.h>
+#endif
 
 #include <asm/alternative.h>
 #include <asm/atomic.h>
@@ -56,6 +59,10 @@
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/ipi.h>
+#include <../../../drivers/soc/sprd/debug/sysdump/sysdump64.h>
+
+DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number);
+EXPORT_PER_CPU_SYMBOL(cpu_number);
 
 /*
  * as from 2.5, kernels no longer have an init_tasks structure
@@ -70,7 +77,16 @@ enum ipi_msg_type {
 	IPI_CPU_STOP,
 	IPI_TIMER,
 	IPI_IRQ_WORK,
+	IPI_WAKEUP,
+#ifdef CONFIG_TRUSTY
+	IPI_CUSTOM_FIRST,
+	IPI_CUSTOM_LAST = 15,
+#endif
 };
+
+#ifdef CONFIG_TRUSTY
+struct irq_domain *ipi_custom_irq_domain;
+#endif
 
 /*
  * Boot a secondary CPU, and assign it the specified idle task.
@@ -94,6 +110,9 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	 * We need to tell the secondary core where to find its stack and the
 	 * page tables.
 	 */
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	secondary_data.task = idle;
+#endif
 	secondary_data.stack = task_stack_page(idle) + THREAD_START_SP;
 	__flush_dcache_area(&secondary_data, sizeof(secondary_data));
 
@@ -117,6 +136,9 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 		pr_err("CPU%u: failed to boot: %d\n", cpu, ret);
 	}
 
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+	secondary_data.task = NULL;
+#endif
 	secondary_data.stack = NULL;
 
 	return ret;
@@ -134,7 +156,10 @@ static void smp_store_cpu_info(unsigned int cpuid)
 asmlinkage void secondary_start_kernel(void)
 {
 	struct mm_struct *mm = &init_mm;
-	unsigned int cpu = smp_processor_id();
+	unsigned int cpu;
+
+	cpu = task_cpu(current);
+	set_my_cpu_offset(per_cpu_offset(cpu));
 
 	/*
 	 * All kernel threads share the same mm context; grab a
@@ -143,15 +168,11 @@ asmlinkage void secondary_start_kernel(void)
 	atomic_inc(&mm->mm_count);
 	current->active_mm = mm;
 
-	set_my_cpu_offset(per_cpu_offset(smp_processor_id()));
-
 	/*
 	 * TTBR0 is only used for the identity mapping at this stage. Make it
 	 * point to zero page to avoid speculatively fetching new entries.
 	 */
-	cpu_set_reserved_ttbr0();
-	local_flush_tlb_all();
-	cpu_set_default_tcr_t0sz();
+	cpu_uninstall_idmap();
 
 	preempt_disable();
 	trace_hardirqs_off();
@@ -444,6 +465,17 @@ acpi_map_gic_cpu_interface(struct acpi_madt_generic_interrupt *processor)
 	/* map the logical cpu id to cpu MPIDR */
 	cpu_logical_map(cpu_count) = hwid;
 
+	/*
+	 * Set-up the ACPI parking protocol cpu entries
+	 * while initializing the cpu_logical_map to
+	 * avoid parsing MADT entries multiple times for
+	 * nothing (ie a valid cpu_logical_map entry should
+	 * contain a valid parking protocol data set to
+	 * initialize the cpu if the parking protocol is
+	 * the only available enable method).
+	 */
+	acpi_set_mailbox_entry(cpu_count, processor);
+
 	cpu_count++;
 }
 
@@ -597,6 +629,8 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 		if (max_cpus == 0)
 			break;
 
+		per_cpu(cpu_number, cpu) = cpu;
+
 		if (cpu == smp_processor_id())
 			continue;
 
@@ -626,6 +660,7 @@ static const char *ipi_types[NR_IPI] __tracepoint_string = {
 	S(IPI_CPU_STOP, "CPU stop interrupts"),
 	S(IPI_TIMER, "Timer broadcast interrupts"),
 	S(IPI_IRQ_WORK, "IRQ work interrupts"),
+	S(IPI_WAKEUP, "CPU wake-up interrupts"),
 };
 
 static void smp_cross_call(const struct cpumask *target, unsigned int ipinr)
@@ -669,6 +704,13 @@ void arch_send_call_function_single_ipi(int cpu)
 	smp_cross_call(cpumask_of(cpu), IPI_CALL_FUNC);
 }
 
+#ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
+void arch_send_wakeup_ipi_mask(const struct cpumask *mask)
+{
+	smp_cross_call(mask, IPI_WAKEUP);
+}
+#endif
+
 #ifdef CONFIG_IRQ_WORK
 void arch_irq_work_raise(void)
 {
@@ -695,11 +737,15 @@ static void ipi_cpu_stop(unsigned int cpu)
 	set_cpu_online(cpu, false);
 
 	local_irq_disable();
+	flush_cache_all();
 
 	while (1)
 		cpu_relax();
 }
 
+#ifdef CONFIG_SPRD_SYSDUMP
+	extern void sysdump_ipi(struct pt_regs *regs);
+#endif
 /*
  * Main handler for inter-processor interrupts
  */
@@ -726,6 +772,9 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 
 	case IPI_CPU_STOP:
 		irq_enter();
+		#ifdef CONFIG_SPRD_SYSDUMP
+			sysdump_ipi(regs);
+		#endif
 		ipi_cpu_stop(cpu);
 		irq_exit();
 		break;
@@ -746,8 +795,26 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 		break;
 #endif
 
+#ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
+	case IPI_WAKEUP:
+		WARN_ONCE(!acpi_parking_protocol_valid(cpu),
+			  "CPU%u: Wake-up IPI outside the ACPI parking protocol\n",
+			  cpu);
+		break;
+#endif
+
 	default:
+#ifdef CONFIG_TRUSTY
+		if (ipi_custom_irq_domain &&
+		    ipinr >= IPI_CUSTOM_FIRST && ipinr <= IPI_CUSTOM_LAST)
+			handle_domain_irq(ipi_custom_irq_domain, ipinr, regs);
+		else
+			pr_crit("CPU%u: Unknown IPI message 0x%x\n",
+				cpu, ipinr);
+#else
 		pr_crit("CPU%u: Unknown IPI message 0x%x\n", cpu, ipinr);
+
+#endif
 		break;
 	}
 
@@ -755,6 +822,87 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 		trace_ipi_exit_rcuidle(ipi_types[ipinr]);
 	set_irq_regs(old_regs);
 }
+
+#ifdef CONFIG_TRUSTY
+static void custom_ipi_enable(struct irq_data *data)
+{
+	/*
+	 * Always trigger a new ipi on enable. This only works for clients
+	 * that then clear the ipi before unmasking interrupts.
+	 */
+	smp_cross_call(cpumask_of(smp_processor_id()), data->hwirq);
+}
+
+static void custom_ipi_disable(struct irq_data *data)
+{
+}
+
+static struct irq_chip custom_ipi_chip = {
+	.name			= "CustomIPI",
+	.irq_enable		= custom_ipi_enable,
+	.irq_disable		= custom_ipi_disable,
+};
+
+static void handle_custom_ipi_irq(struct irq_desc *desc)
+{
+	if (!desc->action) {
+		pr_crit("CPU%u: Unknown IPI message 0x%x, no custom handler\n",
+			smp_processor_id(), irq_desc_get_irq(desc));
+		return;
+	}
+
+	if (!cpumask_test_cpu(smp_processor_id(), desc->percpu_enabled))
+		return; /* IPIs may not be maskable in hardware */
+
+	handle_percpu_devid_irq(desc);
+}
+
+static int custom_ipi_domain_map(struct irq_domain *d, unsigned int irq,
+				 irq_hw_number_t hw)
+{
+	if (hw < IPI_CUSTOM_FIRST || hw > IPI_CUSTOM_LAST) {
+		pr_err("hwirq-%u is not in supported range for CustomIPI IRQ domain\n",
+		       (uint)hw);
+		return -EINVAL;
+	}
+
+	irq_set_percpu_devid(irq);
+	irq_set_chip_and_handler(irq, &custom_ipi_chip, handle_custom_ipi_irq);
+	irq_set_status_flags(irq, IRQ_NOAUTOEN);
+
+	return 0;
+}
+
+static const struct irq_domain_ops custom_ipi_domain_ops = {
+	.map = custom_ipi_domain_map,
+};
+
+static int __init smp_custom_ipi_init(void)
+{
+	struct device_node *np;
+
+	np = of_find_compatible_node(NULL, NULL, "android,CustomIPI");
+	if (np) {
+		/*
+		 * Register linear irq doman to cover the whole IPI range
+		 * even though we are only using part of it. Proper IRQ
+		 * range check will be done by an implementation of mapping
+		 * routine.
+		 */
+		pr_info("Initilizing CustomIPI irq domain\n");
+		ipi_custom_irq_domain =
+			irq_domain_add_linear(np,
+					      IPI_CUSTOM_LAST + 1,
+					      &custom_ipi_domain_ops,
+					      NULL);
+		WARN_ON(!ipi_custom_irq_domain);
+		return 0;
+	}
+
+	return 0;
+}
+core_initcall(smp_custom_ipi_init);
+#endif
 
 void smp_send_reschedule(int cpu)
 {

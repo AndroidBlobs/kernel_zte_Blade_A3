@@ -373,7 +373,7 @@ asmlinkage void secondary_start_kernel(void)
 
 	cpu_init();
 
-	pr_debug("CPU%u: Booted secondary processor\n", cpu);
+	pr_info("CPU%u: Booted secondary processor\n", cpu);
 
 	preempt_disable();
 	trace_hardirqs_off();
@@ -563,6 +563,7 @@ static void ipi_cpu_stop(unsigned int cpu)
 	local_fiq_disable();
 	local_irq_disable();
 
+	flush_cache_all();
 	while (1)
 		cpu_relax();
 }
@@ -588,6 +589,9 @@ asmlinkage void __exception_irq_entry do_IPI(int ipinr, struct pt_regs *regs)
 	handle_IPI(ipinr, regs);
 }
 
+#ifdef CONFIG_SPRD_SYSDUMP
+		extern void sysdump_ipi(struct pt_regs *regs);
+#endif
 void handle_IPI(int ipinr, struct pt_regs *regs)
 {
 	unsigned int cpu = smp_processor_id();
@@ -628,6 +632,9 @@ void handle_IPI(int ipinr, struct pt_regs *regs)
 
 	case IPI_CPU_STOP:
 		irq_enter();
+		#ifdef CONFIG_SPRD_SYSDUMP
+			sysdump_ipi(regs);
+		#endif
 		ipi_cpu_stop(cpu);
 		irq_exit();
 		break;

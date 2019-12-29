@@ -18,6 +18,8 @@
 #include <asm/dma.h>		/* for MAX_DMA_PFN */
 #include <asm/microcode.h>
 
+#include <asm/mv/mobilevisor.h>
+
 /*
  * We need to define the tracepoints somewhere, and tlb.c
  * is only compied when SMP=y.
@@ -586,8 +588,11 @@ void __init init_mem_mapping(void)
 	end = max_low_pfn << PAGE_SHIFT;
 #endif
 
-	/* the ISA range is always mapped regardless of memory holes */
-	init_memory_mapping(0, ISA_END_ADDRESS);
+	/* Don't use the low area of 1M for VMM */
+	if (!is_x86_mobilevisor()) {
+		/* the ISA range is always mapped regardless of memory holes */
+		init_memory_mapping(0, ISA_END_ADDRESS);
+	}
 
 	/*
 	 * If the allocation is in bottom-up direction, we setup direct mapping
@@ -739,7 +744,15 @@ void __init zone_sizes_init(void)
 	memset(max_zone_pfns, 0, sizeof(max_zone_pfns));
 
 #ifdef CONFIG_ZONE_DMA
+#ifdef CONFIG_ZONE_DMA_4G
+	/*
+	 * Some ATOM devices doesn't has legacy ISA dma support,
+	 * set DMA area to same define(<4G) as ARM.
+	 */
+	max_zone_pfns[ZONE_DMA]		= min(MAX_DMA32_PFN, max_low_pfn);
+#else
 	max_zone_pfns[ZONE_DMA]		= min(MAX_DMA_PFN, max_low_pfn);
+#endif
 #endif
 #ifdef CONFIG_ZONE_DMA32
 	max_zone_pfns[ZONE_DMA32]	= min(MAX_DMA32_PFN, max_low_pfn);

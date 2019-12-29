@@ -5,6 +5,8 @@
 #include <asm/pgtable.h>
 #include <asm/realmode.h>
 
+#include <asm/mv/mobilevisor.h>
+
 struct real_mode_header *real_mode_header;
 u32 *trampoline_cr4_features;
 
@@ -13,6 +15,10 @@ void __init reserve_real_mode(void)
 	phys_addr_t mem;
 	unsigned char *base;
 	size_t size = PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
+
+	/* VMM guest no real mode need */
+	if (is_x86_mobilevisor())
+		return;
 
 	/* Has to be under 1M so we can execute real-mode AP code. */
 	mem = memblock_find_in_range(0, 1<<20, size, PAGE_SIZE);
@@ -39,6 +45,9 @@ void __init setup_real_mode(void)
 	u64 *trampoline_pgd;
 	u64 efer;
 #endif
+
+	if (is_x86_mobilevisor())
+		return;
 
 	base = (unsigned char *)real_mode_header;
 
@@ -101,16 +110,21 @@ static int __init set_real_mode_permissions(void)
 {
 	unsigned char *base = (unsigned char *) real_mode_header;
 	size_t size = PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
+	size_t ro_size, text_size;
+	unsigned long text_start;
 
-	size_t ro_size =
+	if (is_x86_mobilevisor())
+		return 0;
+
+	ro_size =
 		PAGE_ALIGN(real_mode_header->ro_end) -
 		__pa(base);
 
-	size_t text_size =
+	text_size =
 		PAGE_ALIGN(real_mode_header->ro_end) -
 		real_mode_header->text_start;
 
-	unsigned long text_start =
+	text_start =
 		(unsigned long) __va(real_mode_header->text_start);
 
 	set_memory_nx((unsigned long) base, size >> PAGE_SHIFT);

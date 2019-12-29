@@ -81,6 +81,7 @@ int set_pages_array_wb(struct page **pages, int addrinarray);
 
 int set_pages_uc(struct page *page, int numpages);
 int set_pages_wb(struct page *page, int numpages);
+int set_pages_wc(struct page *page, int numpages);
 int set_pages_x(struct page *page, int numpages);
 int set_pages_nx(struct page *page, int numpages);
 int set_pages_ro(struct page *page, int numpages);
@@ -91,16 +92,10 @@ void clflush_cache_range(void *addr, unsigned int size);
 
 #define mmio_flush_range(addr, size) clflush_cache_range(addr, size)
 
-#ifdef CONFIG_DEBUG_RODATA
-void mark_rodata_ro(void);
 extern const int rodata_test_data;
 extern int kernel_set_to_readonly;
 void set_kernel_text_rw(void);
 void set_kernel_text_ro(void);
-#else
-static inline void set_kernel_text_rw(void) { }
-static inline void set_kernel_text_ro(void) { }
-#endif
 
 #ifdef CONFIG_DEBUG_RODATA_TEST
 int rodata_test(void);
@@ -108,6 +103,13 @@ int rodata_test(void);
 static inline int rodata_test(void)
 {
 	return 0;
+}
+#endif
+
+#ifdef CONFIG_X86_DMA_INCOHERENT
+static inline void pages_sync(struct page *page, unsigned long offset, size_t size)
+{
+	clflush_cache_range(page_address(page) + offset, size);
 }
 #endif
 

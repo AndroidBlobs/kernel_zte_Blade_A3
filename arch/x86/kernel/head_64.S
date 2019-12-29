@@ -162,6 +162,82 @@ startup_64:
 
 	movq	$(early_level4_pgt - __START_KERNEL_map), %rax
 	jmp 1f
+ #ifdef CONFIG_MOBILEVISOR
+ ENTRY(mv_secondary_startup_64)
+	/*
+	 * Fixup the physical addresses in the page table
+	 */
+	mov	$0, %rbp
+
+	addq	%rbp, init_level4_pgt + (L4_START_KERNEL*8)(%rip)
+
+	addq	%rbp, level3_kernel_pgt + (510*8)(%rip)
+	addq	%rbp, level3_kernel_pgt + (511*8)(%rip)
+
+	addq	%rbp, level2_fixmap_pgt + (506*8)(%rip)
+
+	/*
+	 * Set up the identity mapping for the switchover.  These
+	 * entries should *NOT* have the global bit set!  This also
+	 * creates a bunch of nonsense entries but that is fine --
+	 * it avoids problems around wraparound.
+	 */
+	leaq	_text(%rip), %rdi
+	leaq	init_level4_pgt(%rip), %rbx
+
+	movq	%rdi, %rax
+	shrq	$PGDIR_SHIFT, %rax
+
+	leaq	(4096 + _KERNPG_TABLE)(%rbx), %rdx
+	movq	%rdx, 0(%rbx,%rax,8)
+	movq	%rdx, 8(%rbx,%rax,8)
+
+	addq	$4096, %rdx
+	movq	%rdi, %rax
+	shrq	$PUD_SHIFT, %rax
+	andl	$(PTRS_PER_PUD-1), %eax
+	movq	%rdx, 4096(%rbx,%rax,8)
+	incl	%eax
+	andl	$(PTRS_PER_PUD-1), %eax
+	movq	%rdx, 4096(%rbx,%rax,8)
+
+	addq	$8192, %rbx
+	movq	%rdi, %rax
+	shrq	$PMD_SHIFT, %rdi
+	addq	$(__PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL), %rax
+	leaq	(_end - 1)(%rip), %rcx
+	shrq	$PMD_SHIFT, %rcx
+	subq	%rdi, %rcx
+	incl	%ecx
+
+10:
+	andq	$(PTRS_PER_PMD - 1), %rdi
+	movq	%rax, (%rbx,%rdi,8)
+	incq	%rdi
+	addq	$PMD_SIZE, %rax
+	decl	%ecx
+	jnz	10b
+
+	/*
+	 * Fixup the kernel text+data virtual addresses. Note that
+	 * we might write invalid pmds, when the kernel is relocated
+	 * cleanup_highmap() fixes this up along with the mappings
+	 * beyond _end.
+	 */
+	leaq	level2_kernel_pgt(%rip), %rdi
+	leaq	4096(%rdi), %r8
+	/* See if it is a valid page table entry */
+11:	testq	$1, 0(%rdi)
+	jz	12f
+	addq	%rbp, 0(%rdi)
+	/* Go to the next page */
+12:	addq	$8, %rdi
+	cmp	%r8, %rdi
+	jne	11b
+
+	/* Fixup phys_base */
+	addq	%rbp, phys_base(%rip)
+#endif
 ENTRY(secondary_startup_64)
 	/*
 	 * At this point the CPU runs in 64bit mode CS.L = 1 CS.D = 0,
@@ -208,8 +284,11 @@ ENTRY(secondary_startup_64)
 	btl	$20,%edi		/* No Execute supported? */
 	jnc     1f
 	btsl	$_EFER_NX, %eax
+	wrmsr
 	btsq	$_PAGE_BIT_NX,early_pmd_flags(%rip)
+	jmp 2f
 1:	wrmsr				/* Make changes effective */
+2:
 
 	/* Setup cr0 */
 #define CR0_STATE	(X86_CR0_PE | X86_CR0_MP | X86_CR0_ET | \

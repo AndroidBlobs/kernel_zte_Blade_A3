@@ -37,6 +37,12 @@
 void (*pm_power_off)(void);
 EXPORT_SYMBOL(pm_power_off);
 
+void (*x86_pm_restart)(enum reboot_mode reboot_mode, const char *cmd);
+EXPORT_SYMBOL(x86_pm_restart);
+
+void (*x86_pm_restart_prepare)(const char *cmd);
+EXPORT_SYMBOL(x86_pm_restart_prepare);
+
 static const struct desc_ptr no_idt = {};
 
 /*
@@ -648,6 +654,10 @@ static void __machine_emergency_restart(int emergency)
 static void native_machine_restart(char *__unused)
 {
 	pr_notice("machine restart\n");
+	if (x86_pm_restart_prepare)
+		x86_pm_restart_prepare(__unused);
+	if (x86_pm_restart)
+		x86_pm_restart(reboot_mode, __unused);
 
 	if (!reboot_force)
 		machine_shutdown();
