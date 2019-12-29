@@ -65,6 +65,10 @@ do {									\
 
 #endif /* DUMP_MSGS */
 
+/* OEM for SCSI Command sent by OS X */
+#define SC_GET_CONFIGRATION    0x46
+#define SC_SET_CD_SPEED           0xbb
+
 /* Length of a SCSI Command Data Block */
 #define MAX_COMMAND_SIZE	16
 
