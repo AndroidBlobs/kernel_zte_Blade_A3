@@ -870,6 +870,18 @@ ktime_t tick_nohz_get_sleep_length(void)
 	return ts->sleep_length;
 }
 
+/**
+ * tick_nohz_get_idle_calls - return the current idle calls counter value
+ *
+ * Called from the schedutil frequency scaling governor in scheduler context.
+ */
+unsigned long tick_nohz_get_idle_calls(void)
+{
+	struct tick_sched *ts = this_cpu_ptr(&tick_cpu_sched);
+
+	return ts->idle_calls;
+}
+
 static void tick_nohz_account_idle_ticks(struct tick_sched *ts)
 {
 #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
@@ -1077,6 +1089,16 @@ static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
 
 	return HRTIMER_RESTART;
 }
+
+#ifdef CONFIG_SPRD_EIRQSOFF
+bool is_tick_sched_timer(void *fn)
+{
+	if (fn == tick_sched_timer)
+		return true;
+	return false;
+}
+EXPORT_SYMBOL_GPL(is_tick_sched_timer);
+#endif
 
 static int sched_skew_tick;
 

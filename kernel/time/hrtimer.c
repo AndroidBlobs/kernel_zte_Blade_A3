@@ -984,7 +984,7 @@ static inline ktime_t hrtimer_update_lowres(struct hrtimer *timer, ktime_t tim,
  *		relative (HRTIMER_MODE_REL)
  */
 void hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
-			    unsigned long delta_ns, const enum hrtimer_mode mode)
+			    u64 delta_ns, const enum hrtimer_mode mode)
 {
 	struct hrtimer_clock_base *base, *new_base;
 	unsigned long flags;
@@ -1192,6 +1192,20 @@ bool hrtimer_active(const struct hrtimer *timer)
 }
 EXPORT_SYMBOL_GPL(hrtimer_active);
 
+#ifdef CONFIG_SPRD_EIRQSOFF
+extern bool is_tick_sched_timer(void *fn);
+static int __read_mostly hrtimer_latency_monitor = 20; /*ms*/
+static int __init hrtimer_latency_monitor_setup(char *str)
+{
+	get_option(&str, &hrtimer_latency_monitor);
+	if (hrtimer_latency_monitor < 10)
+		hrtimer_latency_monitor = 10;
+	pr_info("SPRDBG: hrtimer monitor latency set to %d ms\n",
+		hrtimer_latency_monitor);
+	return 0;
+}
+early_param("hrtimer_latency_monitor", hrtimer_latency_monitor_setup);
+#endif
 /*
  * The write_seqcount_barrier()s in __run_hrtimer() split the thing into 3
  * distinct sections:
@@ -1216,6 +1230,9 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 {
 	enum hrtimer_restart (*fn)(struct hrtimer *);
 	int restart;
+#ifdef CONFIG_SPRD_EIRQSOFF
+	u64 jiff_s = 0;
+#endif
 
 	lockdep_assert_held(&cpu_base->lock);
 
@@ -1250,7 +1267,23 @@ static void __run_hrtimer(struct hrtimer_cpu_base *cpu_base,
 	 */
 	raw_spin_unlock(&cpu_base->lock);
 	trace_hrtimer_expire_entry(timer, now);
+#ifdef CONFIG_SPRD_EIRQSOFF
+	if (!is_tick_sched_timer(fn))
+		jiff_s = get_jiffies_64();
+#endif
 	restart = fn(timer);
+#ifdef CONFIG_SPRD_EIRQSOFF
+	if (!is_tick_sched_timer(fn)) {
+		jiff_s = jiffies_to_msecs(get_jiffies_64()-jiff_s);
+		if (jiff_s > hrtimer_latency_monitor)
+			pr_warn("SPRDDBG: Timer[%p] set by[%d/%s] func[%pS] execute[%lld ms]\n",
+#ifdef CONFIG_TIMER_STATS
+				timer, timer->start_pid, timer->start_comm, fn, jiff_s);
+#else
+				timer, 0, "", fn, jiff_s);
+#endif
+	}
+#endif
 	trace_hrtimer_expire_exit(timer);
 	raw_spin_lock(&cpu_base->lock);
 
@@ -1553,7 +1586,7 @@ long hrtimer_nanosleep(struct timespec *rqtp, struct timespec __user *rmtp,
 	struct restart_block *restart;
 	struct hrtimer_sleeper t;
 	int ret = 0;
-	unsigned long slack;
+	u64 slack;
 
 	slack = current->timer_slack_ns;
 	if (dl_task(current) || rt_task(current))
@@ -1729,7 +1762,7 @@ void __init hrtimers_init(void)
  * @clock:	timer clock, CLOCK_MONOTONIC or CLOCK_REALTIME
  */
 int __sched
-schedule_hrtimeout_range_clock(ktime_t *expires, unsigned long delta,
+schedule_hrtimeout_range_clock(ktime_t *expires, u64 delta,
 			       const enum hrtimer_mode mode, int clock)
 {
 	struct hrtimer_sleeper t;
@@ -1797,7 +1830,7 @@ schedule_hrtimeout_range_clock(ktime_t *expires, unsigned long delta,
  *
  * Returns 0 when the timer has expired otherwise -EINTR
  */
-int __sched schedule_hrtimeout_range(ktime_t *expires, unsigned long delta,
+int __sched schedule_hrtimeout_range(ktime_t *expires, u64 delta,
 				     const enum hrtimer_mode mode)
 {
 	return schedule_hrtimeout_range_clock(expires, delta, mode,

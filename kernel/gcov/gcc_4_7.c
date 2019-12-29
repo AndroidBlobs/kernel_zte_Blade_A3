@@ -21,7 +21,7 @@
 #if __GNUC__ == 5 && __GNUC_MINOR__ >= 1
 #define GCOV_COUNTERS			10
 #elif __GNUC__ == 4 && __GNUC_MINOR__ >= 9
-#define GCOV_COUNTERS			9
+#define GCOV_COUNTERS			11
 #else
 #define GCOV_COUNTERS			8
 #endif
@@ -83,12 +83,21 @@ struct gcov_fn_info {
  */
 struct gcov_info {
 	unsigned int version;
+#if __GNUC__ == 4 && __GNUC_MINOR__ >= 9
+	struct gcov_module_info *mod_info;
+#endif
 	struct gcov_info *next;
 	unsigned int stamp;
 	const char *filename;
+#if __GNUC__ == 4 && __GNUC_MINOR__ >= 9
+	unsigned int eof_pos;
+#endif
 	void (*merge[GCOV_COUNTERS])(gcov_type *, unsigned int);
 	unsigned int n_functions;
 	struct gcov_fn_info **functions;
+#if __GNUC__ == 4 && __GNUC_MINOR__ >= 9
+	char **build_info;
+#endif
 };
 
 /**

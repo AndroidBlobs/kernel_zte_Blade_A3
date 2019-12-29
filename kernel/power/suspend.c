@@ -19,6 +19,7 @@
 #include <linux/gfp.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
@@ -26,11 +27,16 @@
 #include <linux/suspend.h>
 #include <linux/syscore_ops.h>
 #include <linux/ftrace.h>
+#include <linux/rtc.h>
 #include <trace/events/power.h>
 #include <linux/compiler.h>
 #include <linux/moduleparam.h>
+#include <linux/wakeup_reason.h>
 
 #include "power.h"
+
+#define DEEP_SLEEP_RETRY_DIRTY_WRITEBACK_THRESHOLD     128     /* 128kB */
+#define DEEP_SLEEP_RETRY_TRIGGER_SYNC_QUEUE_THRESHOLD  2048    /* 2048kB */
 
 const char *pm_labels[] = { "mem", "standby", "freeze", NULL };
 const char *pm_states[PM_SUSPEND_MAX];
@@ -44,6 +50,10 @@ static DECLARE_WAIT_QUEUE_HEAD(suspend_freeze_wait_head);
 
 enum freeze_state __read_mostly suspend_freeze_state;
 static DEFINE_SPINLOCK(suspend_freeze_lock);
+
+static struct workqueue_struct *suspend_sys_sync_work_queue;
+static int sync_start;
+static DEFINE_SPINLOCK(suspend_sys_sync_lock);
 
 void freeze_set_ops(const struct platform_freeze_ops *ops)
 {
@@ -266,16 +276,18 @@ static int suspend_test(int level)
  */
 static int suspend_prepare(suspend_state_t state)
 {
-	int error;
+	int error, nr_calls = 0;
 
 	if (!sleep_state_supported(state))
 		return -EPERM;
 
 	pm_prepare_console();
 
-	error = pm_notifier_call_chain(PM_SUSPEND_PREPARE);
-	if (error)
+	error = __pm_notifier_call_chain(PM_SUSPEND_PREPARE, -1, &nr_calls);
+	if (error) {
+		nr_calls--;
 		goto Finish;
+	}
 
 	trace_suspend_resume(TPS("freeze_processes"), 0, true);
 	error = suspend_freeze_processes();
@@ -286,7 +298,7 @@ static int suspend_prepare(suspend_state_t state)
 	suspend_stats.failed_freeze++;
 	dpm_save_failed_step(SUSPEND_FREEZE);
  Finish:
-	pm_notifier_call_chain(PM_POST_SUSPEND);
+	__pm_notifier_call_chain(PM_POST_SUSPEND, nr_calls, NULL);
 	pm_restore_console();
 	return error;
 }
@@ -312,7 +324,8 @@ void __weak arch_suspend_enable_irqs(void)
  */
 static int suspend_enter(suspend_state_t state, bool *wakeup)
 {
-	int error;
+	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
+	int error, last_dev;
 
 	error = platform_suspend_prepare(state);
 	if (error)
@@ -320,7 +333,11 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 
 	error = dpm_suspend_late(PMSG_SUSPEND);
 	if (error) {
+		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
+		last_dev %= REC_FAILED_NUM;
 		printk(KERN_ERR "PM: late suspend of devices failed\n");
+		log_suspend_abort_reason("%s device failed to power down",
+			suspend_stats.failed_devs[last_dev]);
 		goto Platform_finish;
 	}
 	error = platform_suspend_prepare_late(state);
@@ -329,7 +346,11 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 
 	error = dpm_suspend_noirq(PMSG_SUSPEND);
 	if (error) {
+		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
+		last_dev %= REC_FAILED_NUM;
 		printk(KERN_ERR "PM: noirq suspend of devices failed\n");
+		log_suspend_abort_reason("noirq suspend of %s device failed",
+			suspend_stats.failed_devs[last_dev]);
 		goto Platform_early_resume;
 	}
 	error = platform_suspend_prepare_noirq(state);
@@ -353,8 +374,10 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	}
 
 	error = disable_nonboot_cpus();
-	if (error || suspend_test(TEST_CPUS))
+	if (error || suspend_test(TEST_CPUS)) {
+		log_suspend_abort_reason("Disabling non-boot cpus failed");
 		goto Enable_cpus;
+	}
 
 	arch_suspend_disable_irqs();
 	BUG_ON(!irqs_disabled());
@@ -370,6 +393,9 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 				state, false);
 			events_check_enabled = false;
 		} else if (*wakeup) {
+			pm_get_active_wakeup_sources(suspend_abort,
+				MAX_SUSPEND_ABORT_LEN);
+			log_suspend_abort_reason(suspend_abort);
 			error = -EBUSY;
 		}
 		syscore_resume();
@@ -417,6 +443,7 @@ int suspend_devices_and_enter(suspend_state_t state)
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
 		pr_err("PM: Some devices failed to suspend, or early wake event detected\n");
+		log_suspend_abort_reason("Some devices failed to suspend, or early wake event detected");
 		goto Recover_platform;
 	}
 	suspend_test_finish("suspend devices");
@@ -457,6 +484,32 @@ static void suspend_finish(void)
 	pm_restore_console();
 }
 
+static void suspend_sys_sync(struct work_struct *work)
+{
+	pr_info("PM: suspend sync-queue sync begin...\n");
+	sys_sync();
+	pr_info("PM: suspend sync-queue sync done\n");
+
+	spin_lock(&suspend_sys_sync_lock);
+	sync_start = 0;
+	spin_unlock(&suspend_sys_sync_lock);
+}
+static DECLARE_WORK(suspend_sys_sync_work, suspend_sys_sync);
+
+void suspend_sys_sync_queue(void)
+{
+	int ret;
+
+	spin_lock(&suspend_sys_sync_lock);
+	if (sync_start == 0) {
+		ret = queue_work(suspend_sys_sync_work_queue,
+					&suspend_sys_sync_work);
+		if (ret)
+			sync_start = 1;
+	}
+	spin_unlock(&suspend_sys_sync_lock);
+}
+
 /**
  * enter_state - Do common work needed to enter system sleep state.
  * @state: System sleep state to enter.
@@ -468,6 +521,7 @@ static void suspend_finish(void)
 static int enter_state(suspend_state_t state)
 {
 	int error;
+	unsigned long dirty;
 
 	trace_suspend_resume(TPS("suspend_enter"), state, true);
 	if (state == PM_SUSPEND_FREEZE) {
@@ -483,6 +537,25 @@ static int enter_state(suspend_state_t state)
 	}
 	if (!mutex_trylock(&pm_mutex))
 		return -EBUSY;
+
+	dirty = (global_page_state(NR_FILE_DIRTY)
+			+ global_page_state(NR_WRITEBACK)) << (PAGE_SHIFT - 10);
+	spin_lock(&suspend_sys_sync_lock);
+	if (sync_start == 1) {
+		spin_unlock(&suspend_sys_sync_lock);
+		error = -EBUSY;
+		pr_info("PM: suspend sync-queue syncing(%lu kB)...\n", dirty);
+		goto Unlock;
+	}
+	spin_unlock(&suspend_sys_sync_lock);
+	if (dirty > DEEP_SLEEP_RETRY_DIRTY_WRITEBACK_THRESHOLD) {
+		if (dirty < DEEP_SLEEP_RETRY_TRIGGER_SYNC_QUEUE_THRESHOLD)
+			suspend_sys_sync_queue();
+		error = -EBUSY;
+		pr_info("PM: dirty and writeback data is %lu kB, "
+			"it's too much for sys_sync, try again!\n", dirty);
+		goto Unlock;
+	}
 
 	if (state == PM_SUSPEND_FREEZE)
 		freeze_begin();
@@ -518,6 +591,18 @@ static int enter_state(suspend_state_t state)
 	return error;
 }
 
+static void pm_suspend_marker(char *annotation)
+{
+	struct timespec ts;
+	struct rtc_time tm;
+
+	getnstimeofday(&ts);
+	rtc_time_to_tm(ts.tv_sec, &tm);
+	pr_info("PM: suspend %s %d-%02d-%02d %02d:%02d:%02d.%09lu UTC\n",
+		annotation, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+		tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec);
+}
+
 /**
  * pm_suspend - Externally visible function for suspending the system.
  * @state: System sleep state to enter.
@@ -532,6 +617,7 @@ int pm_suspend(suspend_state_t state)
 	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
 		return -EINVAL;
 
+	pm_suspend_marker("entry");
 	error = enter_state(state);
 	if (error) {
 		suspend_stats.fail++;
@@ -539,6 +625,25 @@ int pm_suspend(suspend_state_t state)
 	} else {
 		suspend_stats.success++;
 	}
+	pm_suspend_marker("exit");
 	return error;
 }
 EXPORT_SYMBOL(pm_suspend);
+
+static int __init sync_queue_init(void)
+{
+	suspend_sys_sync_work_queue =
+		create_singlethread_workqueue("suspend_sys_sync");
+	if (suspend_sys_sync_work_queue == NULL)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void  __exit sync_queue_exit(void)
+{
+	destroy_workqueue(suspend_sys_sync_work_queue);
+}
+
+core_initcall(sync_queue_init);
+module_exit(sync_queue_exit);

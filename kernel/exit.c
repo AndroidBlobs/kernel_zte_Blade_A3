@@ -54,10 +54,16 @@
 #include <linux/writeback.h>
 #include <linux/shm.h>
 
+#include "sched/tune.h"
+
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/pgtable.h>
 #include <asm/mmu_context.h>
+
+#ifdef CONFIG_BOOST_SIGKILL_FREE
+#include <linux/boost_sigkill_free.h>
+#endif
 
 static void exit_mm(struct task_struct *tsk);
 
@@ -699,12 +705,18 @@ void do_exit(long code)
 	}
 
 	exit_signals(tsk);  /* sets PF_EXITING */
+
+	schedtune_exit_task(tsk);
+
 	/*
 	 * tsk->flags are checked in the futex code to protect against
 	 * an exiting task cleaning up the robust pi futexes.
 	 */
 	smp_mb();
 	raw_spin_unlock_wait(&tsk->pi_lock);
+#ifdef CONFIG_SWAP_ZDATA
+	exit_proc_reclaim(tsk);
+#endif
 
 	if (unlikely(in_atomic())) {
 		pr_info("note: %s[%d] exited with preempt_count %d\n",
@@ -874,6 +886,10 @@ do_group_exit(int exit_code)
 		}
 		spin_unlock_irq(&sighand->siglock);
 	}
+#ifdef CONFIG_BOOST_SIGKILL_FREE
+	if (sysctl_boost_sigkill_free && sig_kernel_kill(exit_code))
+		fast_free_user_mem();
+#endif
 
 	do_exit(exit_code);
 	/* NOTREACHED */
