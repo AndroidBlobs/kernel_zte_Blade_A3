@@ -223,7 +223,7 @@ extern struct page *__page_cache_alloc(gfp_t gfp);
 #else
 static inline struct page *__page_cache_alloc(gfp_t gfp)
 {
-	return alloc_pages(gfp, 0);
+	return alloc_pages_dont_record(gfp, 0);
 }
 #endif
 

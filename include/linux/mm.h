@@ -51,6 +51,17 @@ extern int sysctl_legacy_va_layout;
 #define sysctl_legacy_va_layout 0
 #endif
 
+#ifdef CONFIG_HAVE_ARCH_MMAP_RND_BITS
+extern const int mmap_rnd_bits_min;
+extern const int mmap_rnd_bits_max;
+extern int mmap_rnd_bits __read_mostly;
+#endif
+#ifdef CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS
+extern const int mmap_rnd_compat_bits_min;
+extern const int mmap_rnd_compat_bits_max;
+extern int mmap_rnd_compat_bits __read_mostly;
+#endif
+
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/processor.h>
@@ -107,6 +118,8 @@ extern struct rw_semaphore nommu_region_sem;
 
 extern unsigned int kobjsize(const void *objp);
 #endif
+
+extern unsigned long totaldetour_pages;
 
 /*
  * vm_flags in vm_area_struct, see mm_types.h.
@@ -984,6 +997,8 @@ static inline int page_mapped(struct page *page)
 	return atomic_read(&(page)->_mapcount) >= 0;
 }
 
+struct address_space *page_mapping(struct page *page);
+
 /*
  * Return true only if the page has been allocated with
  * ALLOC_NO_WATERMARKS and the low watermark was not
@@ -1059,6 +1074,7 @@ extern void pagefault_out_of_memory(void);
 extern void show_free_areas(unsigned int flags);
 extern bool skip_free_areas_node(unsigned int flags, int nid);
 
+void shmem_set_file(struct vm_area_struct *vma, struct file *file);
 int shmem_zero_setup(struct vm_area_struct *);
 #ifdef CONFIG_SHMEM
 bool shmem_mapping(struct address_space *mapping);
@@ -1129,6 +1145,11 @@ struct mm_walk {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
 	void *private;
+#ifdef CONFIG_SWAP_ZDATA
+	bool hiber;
+	unsigned nr_reclaimed;
+	unsigned nr_writedblock;
+#endif
 };
 
 int walk_page_range(unsigned long addr, unsigned long end,
@@ -1674,7 +1695,7 @@ static inline void __free_reserved_page(struct page *page)
 {
 	ClearPageReserved(page);
 	init_page_count(page);
-	__free_page(page);
+	__free_page_dont_record(page);
 }
 
 static inline void free_reserved_page(struct page *page)
@@ -1782,6 +1803,13 @@ extern void show_mem(unsigned int flags);
 extern void si_meminfo(struct sysinfo * val);
 extern void si_meminfo_node(struct sysinfo *val, int nid);
 
+#ifdef CONFIG_E_SHOW_MEM
+enum e_show_mem_type { E_SHOW_MEM_BASIC, E_SHOW_MEM_CLASSIC, E_SHOW_MEM_ALL };
+extern void enhanced_show_mem(enum e_show_mem_type type);
+extern int register_e_show_mem_notifier(struct notifier_block *nb);
+extern int unregister_e_show_mem_notifier(struct notifier_block *nb);
+#endif
+
 extern __printf(3, 4)
 void warn_alloc_failed(gfp_t gfp_mask, unsigned int order,
 		const char *fmt, ...);
@@ -1838,7 +1866,7 @@ extern int vma_adjust(struct vm_area_struct *vma, unsigned long start,
 extern struct vm_area_struct *vma_merge(struct mm_struct *,
 	struct vm_area_struct *prev, unsigned long addr, unsigned long end,
 	unsigned long vm_flags, struct anon_vma *, struct file *, pgoff_t,
-	struct mempolicy *, struct vm_userfaultfd_ctx);
+	struct mempolicy *, struct vm_userfaultfd_ctx, const char __user *);
 extern struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *);
 extern int split_vma(struct mm_struct *,
 	struct vm_area_struct *, unsigned long addr, int new_below);
@@ -2309,6 +2337,32 @@ static inline bool page_is_guard(struct page *page) { return false; }
 void __init setup_nr_node_ids(void);
 #else
 static inline void setup_nr_node_ids(void) {}
+#endif
+
+#ifdef CONFIG_PROCESS_RECLAIM
+enum reclaim_type {
+	RECLAIM_FILE,
+	RECLAIM_ANON,
+	RECLAIM_ALL,
+	RECLAIM_RANGE,
+	RECLAIM_SOFT,
+	RECLAIM_INACTIVE,
+};
+
+struct reclaim_param {
+	struct vm_area_struct *vma;
+	/* Number of pages scanned */
+	int nr_scanned;
+	/* max pages to reclaim */
+	int nr_to_reclaim;
+	/* pages reclaimed */
+	int nr_reclaimed;
+	bool is_task_anon;
+	bool inactive_lru;
+	enum reclaim_type type;
+};
+extern struct reclaim_param reclaim_task_anon(struct task_struct *task,
+		int nr_to_reclaim);
 #endif
 
 #endif /* __KERNEL__ */

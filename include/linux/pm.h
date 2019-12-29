@@ -372,6 +372,11 @@ const struct dev_pm_ops name = { \
 	SET_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
 }
 
+#define LATE_DEV_PM_OPS(name, suspend_fn, resume_fn) \
+const struct dev_pm_ops name = { \
+	SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_fn, resume_fn) \
+}
+
 /*
  * Use this for defining a set of PM operations to be used in all situations
  * (system suspend, hibernation or runtime PM).
@@ -573,6 +578,7 @@ struct dev_pm_info {
 	struct wakeup_source	*wakeup;
 	bool			wakeup_path:1;
 	bool			syscore:1;
+	bool			no_pm_callbacks:1;	/* Owned by the PM core */
 #else
 	unsigned int		should_wakeup:1;
 #endif

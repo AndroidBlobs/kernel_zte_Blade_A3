@@ -1807,4 +1807,18 @@ static inline int xfrm_tunnel_check(struct sk_buff *skb, struct xfrm_state *x,
 
 	return 0;
 }
+#ifdef CONFIG_XFRM_FRAGMENT
+#define XFRM_FRAG_DEFAULT_MTU 1400
+extern int ip4_do_xfrm_frag(struct net *net, struct sock *sk,
+				struct sk_buff *skb, int pmtu,
+				int (*output)(struct net *net,
+					      struct sock *sock,
+					      struct sk_buff *));
+extern int ip6_do_xfrm_frag(struct net *net, struct sock *sk,
+			     struct sk_buff *skb, int pmtu,
+			     int (*output)(struct net *net,
+					   struct sock *sock,
+					   struct sk_buff *));
+#endif
+
 #endif	/* _NET_XFRM_H */

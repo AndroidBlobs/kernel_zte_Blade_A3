@@ -34,11 +34,29 @@ enum { sysctl_hung_task_timeout_secs = 0 };
 #define DEFAULT_MAX_MAP_COUNT	(USHRT_MAX - MAPCOUNT_ELF_CORE_MARGIN)
 
 extern int sysctl_max_map_count;
+#ifdef CONFIG_BOOST_KILL
+extern int sysctl_boost_killing;
+#endif
 
 extern unsigned int sysctl_sched_latency;
 extern unsigned int sysctl_sched_min_granularity;
 extern unsigned int sysctl_sched_wakeup_granularity;
 extern unsigned int sysctl_sched_child_runs_first;
+extern unsigned int sysctl_sched_sync_hint_enable;
+extern unsigned int sysctl_sched_initial_task_util;
+extern unsigned int sysctl_sched_cstate_aware;
+#ifdef CONFIG_SCHED_WALT
+extern unsigned int sysctl_sched_use_walt_cpu_util;
+extern unsigned int sysctl_sched_use_walt_task_util;
+extern unsigned int sysctl_sched_walt_init_task_load_pct;
+extern unsigned int sysctl_sched_walt_cpu_high_irqload;
+#endif
+
+#ifdef CONFIG_INTEL_DWS
+#ifdef CONFIG_SMP
+extern unsigned int sysctl_sched_wakeup_threshold;
+#endif
+#endif
 
 enum sched_tunable_scaling {
 	SCHED_TUNABLESCALING_NONE,
@@ -75,6 +93,22 @@ extern int sysctl_sched_rt_runtime;
 
 #ifdef CONFIG_CFS_BANDWIDTH
 extern unsigned int sysctl_sched_cfs_bandwidth_slice;
+#endif
+
+#ifdef CONFIG_SCHED_TUNE
+extern unsigned int sysctl_sched_cfs_boost;
+int sysctl_sched_cfs_boost_handler(struct ctl_table *table, int write,
+				   void __user *buffer, size_t *length,
+				   loff_t *ppos);
+static inline unsigned int get_sysctl_sched_cfs_boost(void)
+{
+	return sysctl_sched_cfs_boost;
+}
+#else
+static inline unsigned int get_sysctl_sched_cfs_boost(void)
+{
+	return 0;
+}
 #endif
 
 #ifdef CONFIG_SCHED_AUTOGROUP

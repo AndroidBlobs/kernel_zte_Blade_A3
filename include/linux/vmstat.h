@@ -189,6 +189,7 @@ extern void __inc_zone_state(struct zone *, enum zone_stat_item);
 extern void dec_zone_state(struct zone *, enum zone_stat_item);
 extern void __dec_zone_state(struct zone *, enum zone_stat_item);
 
+void quiet_vmstat(void);
 void cpu_vm_stats_fold(int cpu);
 void refresh_zone_stat_thresholds(void);
 
@@ -249,6 +250,7 @@ static inline void __dec_zone_page_state(struct page *page,
 
 static inline void refresh_zone_stat_thresholds(void) { }
 static inline void cpu_vm_stats_fold(int cpu) { }
+static inline void quiet_vmstat(void) { }
 
 static inline void drain_zonestat(struct zone *zone,
 			struct per_cpu_pageset *pset) { }
@@ -260,8 +262,14 @@ static inline void __mod_zone_freepage_state(struct zone *zone, int nr_pages,
 	__mod_zone_page_state(zone, NR_FREE_PAGES, nr_pages);
 	if (is_migrate_cma(migratetype))
 		__mod_zone_page_state(zone, NR_FREE_CMA_PAGES, nr_pages);
+	if (is_migrate_detour(migratetype))
+		__mod_zone_page_state(zone, NR_FREE_DETOUR_PAGES, nr_pages);
 }
 
 extern const char * const vmstat_text[];
 
+extern unsigned long rtcc_reclaim_pages(unsigned long nr_to_reclaim,
+					int swappiness,
+					unsigned long *nr_swapped);
+extern long nr_kswapd_swapped;
 #endif /* _LINUX_VMSTAT_H */
