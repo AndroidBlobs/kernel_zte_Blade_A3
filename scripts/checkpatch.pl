@@ -2348,6 +2348,7 @@ sub process {
 
 # Check for git id commit length and improperly formed commit descriptions
 		if ($in_commit_log && !$commit_log_possible_stack_dump &&
+		    $line !~ /^This reverts commit [0-9a-f]{7,40}/ &&
 		    ($line =~ /\bcommit\s+[0-9a-f]{5,}\b/i ||
 		     ($line =~ /\b[0-9a-f]{12,40}\b/i &&
 		      $line !~ /[\<\[][0-9a-f]{12,40}[\>\]]/i &&
@@ -2397,7 +2398,7 @@ sub process {
 							      $id, $orig_desc);
 
 			if ($short || $long || $space || $case || ($orig_desc ne $description) || !$hasparens) {
-				ERROR("GIT_COMMIT_ID",
+				WARN("GIT_COMMIT_ID",
 				      "Please use git commit description style 'commit <12+ chars of sha1> (\"<title line>\")' - ie: '${init_char}ommit $id (\"$description\")'\n" . $herecurr);
 			}
 		}
