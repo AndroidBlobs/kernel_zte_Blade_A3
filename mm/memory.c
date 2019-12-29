@@ -72,6 +72,10 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_BOOST_SIGKILL_FREE
+#include <linux/boost_sigkill_free.h>
+#endif
+
 #ifdef LAST_CPUPID_NOT_IN_PAGE_FLAGS
 #warning Unfortunate NUMA and NUMA Balancing config, growing page-frame for last_cpupid.
 #endif
@@ -194,7 +198,8 @@ static bool tlb_next_batch(struct mmu_gather *tlb)
 	if (tlb->batch_count == MAX_GATHER_BATCH_COUNT)
 		return false;
 
-	batch = (void *)__get_free_pages(GFP_NOWAIT | __GFP_NOWARN, 0);
+	batch = (void *)__get_free_pages_dont_record(GFP_NOWAIT |
+						     __GFP_NOWARN, 0);
 	if (!batch)
 		return false;
 
@@ -279,7 +284,7 @@ void tlb_finish_mmu(struct mmu_gather *tlb, unsigned long start, unsigned long e
 
 	for (batch = tlb->local.next; batch; batch = next) {
 		next = batch->next;
-		free_pages((unsigned long)batch, 0);
+		free_pages_dont_record((unsigned long)batch, 0);
 	}
 	tlb->local.next = NULL;
 }
@@ -344,7 +349,7 @@ static void tlb_remove_table_rcu(struct rcu_head *head)
 	for (i = 0; i < batch->nr; i++)
 		__tlb_remove_table(batch->tables[i]);
 
-	free_page((unsigned long)batch);
+	free_page_dont_record((unsigned long)batch);
 }
 
 void tlb_table_flush(struct mmu_gather *tlb)
@@ -371,7 +376,8 @@ void tlb_remove_table(struct mmu_gather *tlb, void *table)
 	}
 
 	if (*batch == NULL) {
-		*batch = (struct mmu_table_batch *)__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
+		*batch = (struct mmu_table_batch *)__get_free_page_dont_record
+						   (GFP_NOWAIT | __GFP_NOWARN);
 		if (*batch == NULL) {
 			tlb_remove_table_one(table);
 			return;
@@ -1127,6 +1133,7 @@ again:
 	init_rss_vec(rss);
 	start_pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	pte = start_pte;
+	flush_tlb_batched_pending(mm);
 	arch_enter_lazy_mmu_mode();
 	do {
 		pte_t ptent = *pte;
@@ -3907,5 +3914,50 @@ bool ptlock_alloc(struct page *page)
 void ptlock_free(struct page *page)
 {
 	kmem_cache_free(page_ptl_cachep, page->ptl);
+}
+#endif
+
+#ifdef CONFIG_BOOST_SIGKILL_FREE
+int sysctl_boost_sigkill_free;
+
+static void __fast_free_user_mem(struct mm_struct *mm)
+{
+	struct vm_area_struct *vma;
+	struct mmu_gather tlb;
+
+	tlb_gather_mmu(&tlb, mm, 0, -1);
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (is_vm_hugetlb_page(vma))
+			continue;
+		/*
+		 * mlocked VMAs require explicit munlocking before unmap.
+		 * Let's keep it simple here and skip such VMAs.
+		 */
+		if (vma->vm_flags & VM_LOCKED)
+			continue;
+
+		if (vma_is_anonymous(vma) || !(vma->vm_flags & VM_SHARED))
+			unmap_page_range(&tlb, vma, vma->vm_start,
+					 vma->vm_end, NULL);
+	}
+	tlb_finish_mmu(&tlb, 0, -1);
+}
+
+void fast_free_user_mem(void)
+{
+	struct mm_struct *mm = current->mm;
+
+	if (!mm)
+		return;
+
+	down_read(&mm->mmap_sem);
+	if (test_and_set_bit(MMF_FAST_FREEING, &mm->flags)) {
+		up_read(&mm->mmap_sem);
+		return;
+	}
+
+	__fast_free_user_mem(mm);
+
+	up_read(&mm->mmap_sem);
 }
 #endif
